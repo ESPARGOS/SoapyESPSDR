@@ -86,10 +86,12 @@ installed system-wide, launch Gqrx from the terminal in which
 - Center frequencies from 2300 to 2800 MHz, with 1 kHz tuning resolution
 - Sample rates of 8, 16, and 20 MSa/s
 - Automatic or manual receive gain
-- Manual RX Gain hardware codes from 0 to 127
+- Manual receive gain from 0 to 76 dB in 1 dB steps
 - Open/widest or 13–54 MHz analog receive-filter bandwidth
 
-The RX Gain value is a hardware gain code, not a calibrated value in dB.
+Manual gain selects the ESP32-S31 PHY's calibrated receive-gain table. The
+firmware publishes the available range, unit, and step through its status API,
+and SoapyESPSDR reports those values to applications.
 
 ESP-SDR supports continuous, lossless streaming at 8 and 16 MSa/s. At 20 MSa/s,
 streaming is best-effort and missing samples are reported as overflows.
@@ -144,5 +146,5 @@ The SoapySDR device string accepts these arguments:
 - Receive only.
 - One network client at a time.
 - No hardware timestamps or timed streaming.
-- RX Gain codes are not calibrated in dB.
+- Absolute gain and sensitivity can vary between boards and with frequency.
 - 20 MSa/s is best-effort rather than guaranteed lossless operation.

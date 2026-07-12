@@ -257,6 +257,13 @@ public:
     {
         _config = _http.get("/api/v1/config");
         if (!_config.isObject()) throw std::runtime_error("ESP-SDR returned an invalid configuration");
+        const Json::Value status = _http.get("/api/v1/status");
+        const Json::Value gain = status["manual_rx_gain"];
+        if (gain.isObject() && gain["unit"].asString() == "dB") {
+            _gainMin = gain.get("minimum", 0.0).asDouble();
+            _gainMax = gain.get("maximum", 76.0).asDouble();
+            _gainStep = gain.get("step", 1.0).asDouble();
+        }
     }
 
     ~EspDevice() override
@@ -304,7 +311,8 @@ public:
         if (name != "RX Gain") throw std::runtime_error("unknown gain element: " + name);
         Json::Value patch;
         patch["gain"]["gain_mode"] = 1;
-        patch["gain"]["rx_gain"] = static_cast<unsigned>(std::clamp(std::llround(value), 0ll, 127ll));
+        patch["gain"]["rx_gain"] = static_cast<unsigned>(
+            std::clamp(std::round(value), _gainMin, _gainMax));
         applyPatch(patch);
     }
     double getGain(const int direction, const std::size_t channel) const override
@@ -325,7 +333,7 @@ public:
     {
         checkRx(direction, channel);
         if (name != "RX Gain") throw std::runtime_error("unknown gain element: " + name);
-        return {0, 127, 1};
+        return {_gainMin, _gainMax, _gainStep};
     }
 
     void setFrequency(const int direction, const std::size_t channel, const double frequency,
@@ -794,6 +802,9 @@ private:
     std::mutex _controlMutex;
     mutable std::mutex _configMutex;
     Json::Value _config;
+    double _gainMin = 0.0;
+    double _gainMax = 76.0;
+    double _gainStep = 1.0;
     StreamState *_stream = nullptr;
 };
 
