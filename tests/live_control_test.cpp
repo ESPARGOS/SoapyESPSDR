@@ -4,6 +4,7 @@
 #include <iostream>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 int main(int argc, char **argv)
 {
@@ -17,6 +18,8 @@ int main(int argc, char **argv)
     const double oldBandwidth = device->getBandwidth(SOAPY_SDR_RX, 0);
     const double oldGain = device->getGain(SOAPY_SDR_RX, 0);
     const bool oldAgc = device->getGainMode(SOAPY_SDR_RX, 0);
+    const std::string oldCycleTotal = device->readSetting("cycle_total");
+    const std::string oldCycleStream = device->readSetting("cycle_stream");
     int result = 0;
     try {
         std::cout << "set frequency\n";
@@ -28,7 +31,14 @@ int main(int argc, char **argv)
         if (device->getFrequency(SOAPY_SDR_RX, 0) != 2437125000.0) throw std::runtime_error("frequency readback mismatch");
         if (device->getBandwidth(SOAPY_SDR_RX, 0) != 21e6) throw std::runtime_error("bandwidth readback mismatch");
         if (device->getGain(SOAPY_SDR_RX, 0) != 40) throw std::runtime_error("gain readback mismatch");
-        std::cout << "frequency, analog bandwidth, and gain controls: OK\n";
+        std::cout << "set duty cycle\n";
+        device->writeSetting("cycle_total", "5");
+        device->writeSetting("cycle_stream", "2");
+        if (device->readSetting("cycle_total") != "5" ||
+            device->readSetting("cycle_stream") != "2") throw std::runtime_error("duty-cycle readback mismatch");
+        const std::vector<double> rates = device->listSampleRates(SOAPY_SDR_RX, 0);
+        if (rates.empty() || rates.front() != 8e6 || rates.back() != 80e6) throw std::runtime_error("sample-rate list mismatch");
+        std::cout << "frequency, analog bandwidth, gain, duty cycle, and sample rates: OK\n";
     } catch (const std::exception &error) {
         std::cerr << error.what() << '\n';
         result = 1;
@@ -38,6 +48,8 @@ int main(int argc, char **argv)
         device->setBandwidth(SOAPY_SDR_RX, 0, oldBandwidth);
         device->setGain(SOAPY_SDR_RX, 0, oldGain);
         device->setGainMode(SOAPY_SDR_RX, 0, oldAgc);
+        device->writeSetting("cycle_total", oldCycleTotal);
+        device->writeSetting("cycle_stream", oldCycleStream);
     } catch (const std::exception &error) {
         std::cerr << "restore failed: " << error.what() << '\n';
         result = 1;

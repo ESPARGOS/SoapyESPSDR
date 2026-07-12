@@ -40,6 +40,19 @@ constexpr std::size_t IQ_FRAME_BYTES = IQ_HEADER_BYTES + IQ_SAMPLES * 4 + 4;
 constexpr std::size_t MAX_FRAME_BYTES = 64 * 1024;
 constexpr std::size_t MAX_QUEUE_BLOCKS = 512;
 constexpr uint32_t UDP_VERSION = 1;
+constexpr unsigned ADC_CLOCK_HZ = 80'000'000;
+constexpr unsigned ADC_DECIMATION_MAX = 10;
+constexpr unsigned STREAM_SELECTION_MAX = 1'000'000;
+
+Json::Value intervalTrigger(unsigned total, unsigned streamed)
+{
+    Json::Value trigger(Json::arrayValue);
+    trigger.append(total);
+    trigger.append(0);
+    trigger.append(streamed);
+    for (unsigned i = 3; i < 16; ++i) trigger.append(0);
+    return trigger;
+}
 
 int64_t monotonicNanoseconds()
 {
@@ -244,6 +257,8 @@ struct StreamState {
     std::atomic<uint64_t> queueDrops{0};
     std::atomic<uint64_t> captureRestarts{0};
     std::atomic<int64_t> suppressContinuityUntilNs{0};
+    std::atomic<unsigned> cycleTotal{1};
+    std::atomic<unsigned> cycleStream{1};
 };
 
 class EspDevice final : public SoapySDR::Device {
@@ -253,8 +268,11 @@ public:
         _httpPort(parseUnsigned(valueOr(args, "http_port", "80"), "http_port", 1, 65535)),
         _requestedUdpPort(parseUnsigned(valueOr(args, "udp_port", "0"), "udp_port", 0, 65535)),
         _rxBufferBytes(parseUnsigned(valueOr(args, "rx_buffer_bytes", "33554432"), "rx_buffer_bytes", 65536, 268435456)),
+        _cycleTotal(parseUnsigned(valueOr(args, "cycle_total", "1"), "cycle_total", 1, STREAM_SELECTION_MAX)),
+        _cycleStream(parseUnsigned(valueOr(args, "cycle_stream", "1"), "cycle_stream", 1, STREAM_SELECTION_MAX)),
         _http(_host, _httpPort)
     {
+        if (_cycleStream > _cycleTotal) throw std::runtime_error("cycle_stream must not exceed cycle_total");
         _config = _http.get("/api/v1/config");
         if (!_config.isObject()) throw std::runtime_error("ESP-SDR returned an invalid configuration");
         const Json::Value status = _http.get("/api/v1/status");
@@ -264,6 +282,7 @@ public:
             _gainMax = gain.get("maximum", 76.0).asDouble();
             _gainStep = gain.get("step", 1.0).asDouble();
         }
+        applyDutyCycle(_cycleTotal, _cycleStream);
     }
 
     ~EspDevice() override
@@ -377,12 +396,52 @@ public:
     std::vector<double> listSampleRates(const int direction, const std::size_t channel) const override
     {
         checkRx(direction, channel);
-        return {8e6, 16e6, 20e6};
+        return supportedSampleRates();
     }
     SoapySDR::RangeList getSampleRateRange(const int direction, const std::size_t channel) const override
     {
         checkRx(direction, channel);
-        return {{8e6, 8e6}, {16e6, 16e6}, {20e6, 20e6}};
+        SoapySDR::RangeList ranges;
+        for (const double rate : supportedSampleRates()) ranges.emplace_back(rate, rate);
+        return ranges;
+    }
+
+    SoapySDR::ArgInfoList getSettingInfo() const override
+    {
+        SoapySDR::ArgInfo total;
+        total.key = "cycle_total";
+        total.value = "1";
+        total.name = "Duty cycle: total chunks";
+        total.description = "Total number of chunks in one capture cycle";
+        total.units = "chunks";
+        total.type = SoapySDR::ArgInfo::INT;
+        total.range = SoapySDR::Range(1, STREAM_SELECTION_MAX, 1);
+        SoapySDR::ArgInfo streamed = total;
+        streamed.key = "cycle_stream";
+        streamed.name = "Duty cycle: streamed chunks";
+        streamed.description = "Number of contiguous chunks streamed at the start of each capture cycle";
+        return {total, streamed};
+    }
+    void writeSetting(const std::string &key, const std::string &value) override
+    {
+        unsigned total = _cycleTotal.load();
+        unsigned streamed = _cycleStream.load();
+        if (key == "cycle_total") {
+            total = parseUnsigned(value, "cycle_total", 1, STREAM_SELECTION_MAX);
+            streamed = std::min(streamed, total);
+        } else if (key == "cycle_stream") {
+            streamed = parseUnsigned(value, "cycle_stream", 1, STREAM_SELECTION_MAX);
+            if (streamed > total) throw std::runtime_error("cycle_stream must not exceed cycle_total");
+        } else {
+            throw std::runtime_error("unknown setting: " + key);
+        }
+        applyDutyCycle(total, streamed);
+    }
+    std::string readSetting(const std::string &key) const override
+    {
+        if (key == "cycle_total") return std::to_string(_cycleTotal.load());
+        if (key == "cycle_stream") return std::to_string(_cycleStream.load());
+        throw std::runtime_error("unknown setting: " + key);
     }
 
     void setBandwidth(const int direction, const std::size_t channel, const double bandwidth) override
@@ -486,11 +545,12 @@ public:
         patch["stream"]["output_mode"] = 0;
         patch["stream"]["stream_wifi_packets"] = 0;
         patch["trigger"]["trigger_mode"] = 0;
-        Json::Value trigger(Json::arrayValue);
-        trigger.append(1); trigger.append(0); trigger.append(1);
-        for (unsigned i = 3; i < 16; ++i) trigger.append(0);
-        patch["trigger"]["trigger_config"] = trigger;
+        const unsigned total = _cycleTotal.load();
+        const unsigned streamed = _cycleStream.load();
+        patch["trigger"]["trigger_config"] = intervalTrigger(total, streamed);
         applyPatch(patch);
+        state->cycleTotal = total;
+        state->cycleStream = streamed;
         {
             std::lock_guard<std::mutex> lock(state->mutex);
             state->queue.clear();
@@ -611,10 +671,49 @@ private:
     }
     static unsigned rateToDecimation(double rate)
     {
-        if (std::abs(rate - 8e6) < 1) return 10;
-        if (std::abs(rate - 16e6) < 1) return 5;
-        if (std::abs(rate - 20e6) < 1) return 4;
-        throw std::runtime_error("supported sample rates are 8, 16, and 20 MSa/s");
+        for (unsigned decimation = 1; decimation <= ADC_DECIMATION_MAX; ++decimation) {
+            if (std::abs(rate - double(ADC_CLOCK_HZ) / decimation) < 1) return decimation;
+        }
+        throw std::runtime_error("sample rate must be 80 MSa/s divided by an integer from 1 to 10");
+    }
+    static std::vector<double> supportedSampleRates()
+    {
+        std::vector<double> rates;
+        for (unsigned decimation = ADC_DECIMATION_MAX; decimation != 0; --decimation) {
+            rates.push_back(double(ADC_CLOCK_HZ) / decimation);
+        }
+        return rates;
+    }
+    void applyDutyCycle(unsigned total, unsigned streamed)
+    {
+        if (total == 0 || total > STREAM_SELECTION_MAX || streamed == 0 || streamed > total) {
+            throw std::runtime_error("duty cycle requires 1 <= cycle_stream <= cycle_total <= 1000000");
+        }
+        Json::Value patch;
+        patch["trigger"]["trigger_mode"] = 0;
+        patch["trigger"]["trigger_config"] = intervalTrigger(total, streamed);
+        applyPatch(patch);
+        _cycleTotal = total;
+        _cycleStream = streamed;
+        if (_stream != nullptr) {
+            _stream->cycleTotal = total;
+            _stream->cycleStream = streamed;
+        }
+    }
+    static uint32_t nextSelectedSource(uint32_t source, unsigned total, unsigned streamed)
+    {
+        const unsigned position = source % total;
+        return position + 1u < streamed ? source + 1u : source + (total - position);
+    }
+    static uint32_t selectedCount(uint32_t begin, uint32_t end, unsigned total, unsigned streamed)
+    {
+        if (end <= begin) return 0;
+        const auto before = [total, streamed](uint32_t value) -> uint64_t {
+            const uint64_t cycles = value / total;
+            const unsigned remainder = value % total;
+            return cycles * streamed + std::min(remainder, streamed);
+        };
+        return static_cast<uint32_t>(before(end) - before(begin));
     }
     StreamState *checkedStream(SoapySDR::Stream *stream) const
     {
@@ -691,25 +790,27 @@ private:
         }
         std::lock_guard<std::mutex> lock(state->mutex);
         const bool suppressContinuity = monotonicNanoseconds() < state->suppressContinuityUntilNs.load();
+        const unsigned total = state->cycleTotal.load();
+        const unsigned streamed = state->cycleStream.load();
         if (state->haveExpectedSource) {
             if (source < state->expectedSource) {
                 // Applying RF configuration restarts capture at a low source
                 // index without changing the UDP epoch. Treat only a small
                 // backward step as reordering; otherwise begin a new capture
                 // generation instead of rejecting the restarted stream forever.
-                if (state->expectedSource - source <= 8) return;
+                if (state->expectedSource - source <= std::max(8u, total * 2u)) return;
                 state->queue.clear();
                 state->captureRestarts++;
                 if (!suppressContinuity) state->overflowPending = true;
             }
             if (source > state->expectedSource) {
                 if (!suppressContinuity) {
-                    state->lostChunks += source - state->expectedSource;
+                    state->lostChunks += selectedCount(state->expectedSource, source, total, streamed);
                     state->overflowPending = true;
                 }
             }
         }
-        state->expectedSource = source + 1;
+        state->expectedSource = nextSelectedSource(source, total, streamed);
         state->haveExpectedSource = true;
         if (state->queue.size() >= MAX_QUEUE_BLOCKS) {
             state->queue.pop_front();
@@ -739,8 +840,9 @@ private:
         bool captureRestart = false;
         {
             std::lock_guard<std::mutex> lock(state->mutex);
+            const unsigned reorderWindow = std::max(8u, state->cycleTotal.load() * 2u);
             if (state->haveExpectedSource && header.sourceChunk < state->expectedSource &&
-                state->expectedSource - header.sourceChunk > 8) {
+                state->expectedSource - header.sourceChunk > reorderWindow) {
                 state->queue.clear();
                 state->haveExpectedSource = false;
                 state->captureRestarts++;
@@ -798,6 +900,8 @@ private:
     unsigned _httpPort;
     unsigned _requestedUdpPort;
     unsigned _rxBufferBytes;
+    std::atomic<unsigned> _cycleTotal;
+    std::atomic<unsigned> _cycleStream;
     HttpClient _http;
     std::mutex _controlMutex;
     mutable std::mutex _configMutex;

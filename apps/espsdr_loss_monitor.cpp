@@ -28,12 +28,15 @@ struct Options {
     double rate = 8e6;
     double seconds = 10.0;
     double interval = 1.0;
+    unsigned cycleTotal = 1;
+    unsigned cycleStream = 1;
 };
 
 void usage(const char *program)
 {
     std::cerr << "Usage: " << program
-              << " [--host HOST] [--rate HZ] [--seconds N] [--interval N]\n";
+              << " [--host HOST] [--rate HZ] [--seconds N] [--interval N]"
+                 " [--cycle-total N] [--cycle-stream N]\n";
 }
 
 Options parseOptions(int argc, char **argv)
@@ -51,10 +54,16 @@ Options parseOptions(int argc, char **argv)
         else if (argument == "--rate") options.rate = std::stod(value);
         else if (argument == "--seconds") options.seconds = std::stod(value);
         else if (argument == "--interval") options.interval = std::stod(value);
+        else if (argument == "--cycle-total") options.cycleTotal = std::stoul(value);
+        else if (argument == "--cycle-stream") options.cycleStream = std::stoul(value);
         else throw std::runtime_error("unknown option: " + argument);
     }
     if (options.rate <= 0 || options.seconds <= 0 || options.interval <= 0) {
         throw std::runtime_error("rate, seconds, and interval must be positive");
+    }
+    if (options.cycleTotal == 0 || options.cycleStream == 0 ||
+        options.cycleStream > options.cycleTotal) {
+        throw std::runtime_error("duty cycle requires 1 <= cycle-stream <= cycle-total");
     }
     return options;
 }
@@ -149,7 +158,9 @@ int main(int argc, char **argv)
     SoapySDR::Stream *stream = nullptr;
     try {
         device = SoapySDR::Device::make(
-            "driver=espsdr,host=" + options.host);
+            "driver=espsdr,host=" + options.host +
+            ",cycle_total=" + std::to_string(options.cycleTotal) +
+            ",cycle_stream=" + std::to_string(options.cycleStream));
         if (device == nullptr) throw std::runtime_error("failed to open SoapyESPSDR device");
         const double oldRate = device->getSampleRate(SOAPY_SDR_RX, 0);
         device->setSampleRate(SOAPY_SDR_RX, 0, options.rate);

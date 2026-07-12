@@ -83,15 +83,17 @@ With an explicit address, the string looks like:
 soapy=0,driver=espsdr,host=192.168.0.139
 ```
 
-Select 8 or 16 MSa/s for continuous, lossless streaming. If the module is not
-installed system-wide, launch Gqrx from the terminal in which
-`SOAPY_SDR_PLUGIN_PATH` was exported.
+Select 8 or 16 MSa/s for continuous, lossless streaming. At higher sample
+rates, use the **Duty cycle** device settings to reduce the network data
+rate. If the module is not installed system-wide, launch Gqrx from the terminal
+in which `SOAPY_SDR_PLUGIN_PATH` was exported.
 
 ## Supported controls and formats
 
 - `CS16` native I/Q samples and `CF32` converted samples
 - Center frequencies from 2300 to 2800 MHz, with 1 kHz tuning resolution
-- Sample rates of 8, 16, and 20 MSa/s
+- Sample rates from 8 to 80 MSa/s, corresponding to integer software
+  decimation factors from 10 to 1
 - Automatic or manual receive gain
 - Manual receive gain from 0 to 76 dB in 1 dB steps
 - Open/widest or 13–54 MHz analog receive-filter bandwidth
@@ -100,8 +102,44 @@ Manual gain selects the ESP32-S31 PHY's calibrated receive-gain table. The
 firmware publishes the available range, unit, and step through its status API,
 and SoapyESPSDR reports those values to applications.
 
-ESP-SDR supports continuous, lossless streaming at 8 and 16 MSa/s. At 20 MSa/s,
-streaming is best-effort and missing samples are reported as overflows.
+ESP-SDR supports continuous, lossless streaming at 8 and 16 MSa/s. Higher rates
+are available for captures with a reduced duty cycle; missing samples caused by
+network or receiver overload are reported as overflows.
+
+The `cycle_total` and `cycle_stream` settings control capture duty cycle in
+units of 1,024-sample chunks. For example, `cycle_total=10,cycle_stream=3`
+streams three contiguous chunks followed by seven unstreamed chunks, for a 30%
+duty cycle. Both default to 1 for continuous reception. Deliberately unstreamed
+chunks are not reported as packet loss.
+
+Set these values in the device string so the duty cycle is configured as the
+device is opened:
+
+```text
+soapy=0,driver=espsdr,host=esp-sdr.local,cycle_total=10,cycle_stream=3
+```
+
+The following duty-cycle settings support continuous reception of every
+selected chunk. The average streamed rate accounts for the deliberately
+unstreamed part of each cycle.
+
+| Sample rate | Software decimation | `cycle_total` | `cycle_stream` | Duty cycle | Average streamed rate |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 8 MSa/s | 10 | 1 | 1 | 100% | 8 MSa/s |
+| 8.889 MSa/s | 9 | 1 | 1 | 100% | 8.889 MSa/s |
+| 10 MSa/s | 8 | 1 | 1 | 100% | 10 MSa/s |
+| 11.429 MSa/s | 7 | 1 | 1 | 100% | 11.429 MSa/s |
+| 13.333 MSa/s | 6 | 1 | 1 | 100% | 13.333 MSa/s |
+| 16 MSa/s | 5 | 1 | 1 | 100% | 16 MSa/s |
+| 20 MSa/s | 4 | 2 | 1 | 50% | 10 MSa/s |
+| 26.667 MSa/s | 3 | 3 | 1 | 33.333% | 8.889 MSa/s |
+| 40 MSa/s | 2 | 4 | 1 | 25% | 10 MSa/s |
+| 80 MSa/s | 1 | 8 | 1 | 12.5% | 10 MSa/s |
+
+These cycle geometries were validated end-to-end with zero firmware drops,
+missing selected chunks, host queue drops, or SoapySDR overflow events. Cycle
+geometry matters in addition to average data rate: use the listed values or a
+lower duty cycle, and monitor the loss sensors when using a different geometry.
 
 The analog bandwidth control uses the firmware's Custom/20 MHz digital channel
 path. A bandwidth of zero selects the open/widest analog response; nonzero
@@ -118,6 +156,8 @@ export SOAPY_SDR_PLUGIN_PATH="$PWD/build"
 ./build/espsdr_loss_monitor \
     --host esp-sdr.local \
     --rate 8000000 \
+    --cycle-total 1 \
+    --cycle-stream 1 \
     --seconds 30 \
     --interval 1
 ```
@@ -147,6 +187,8 @@ The SoapySDR device string accepts these arguments:
 | `http_port` | `80` | Firmware HTTP control port. |
 | `udp_port` | `0` | Local UDP port; zero selects an available ephemeral port. |
 | `rx_buffer_bytes` | `33554432` | Requested operating-system UDP receive-buffer size. |
+| `cycle_total` | `1` | Total chunks per duty-cycle period. |
+| `cycle_stream` | `1` | Contiguous streamed chunks at the start of each period. |
 
 ## Limitations
 
@@ -154,4 +196,6 @@ The SoapySDR device string accepts these arguments:
 - One network client at a time.
 - No hardware timestamps or timed streaming.
 - Absolute gain and sensitivity can vary between boards and with frequency.
-- 20 MSa/s is best-effort rather than guaranteed lossless operation.
+- Sample rates above 16 MSa/s generally require a reduced duty cycle when their
+  full data rate exceeds the host or network path's capacity. Applications
+  should monitor the overflow and loss sensors for the chosen cycle geometry.

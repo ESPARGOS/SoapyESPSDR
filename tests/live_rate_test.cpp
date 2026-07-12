@@ -12,14 +12,15 @@
 
 int main(int argc, char **argv)
 {
-    if (argc != 4 && argc != 5) {
-        std::cerr << "usage: espsdr_live_rate_test HOST RATE_HZ SECONDS [CS16|CF32]\n";
+    if (argc < 4 || argc > 6) {
+        std::cerr << "usage: espsdr_live_rate_test HOST RATE_HZ SECONDS [CS16|CF32] [CYCLE_TOTAL]\n";
         return 2;
     }
     const std::string args = "driver=espsdr,host=" + std::string(argv[1]);
     const double rate = std::stod(argv[2]);
     const double seconds = std::stod(argv[3]);
-    const std::string format = argc == 5 ? argv[4] : SOAPY_SDR_CS16;
+    const std::string format = argc >= 5 ? argv[4] : SOAPY_SDR_CS16;
+    const std::string cycleTotal = argc == 6 ? argv[5] : "1";
     SoapySDR::Device *device = SoapySDR::Device::make(args);
     if (device == nullptr) {
         std::cerr << "failed to make device\n";
@@ -29,6 +30,8 @@ int main(int argc, char **argv)
     SoapySDR::Stream *stream = nullptr;
     try {
         device->setSampleRate(SOAPY_SDR_RX, 0, rate);
+        device->writeSetting("cycle_total", cycleTotal);
+        device->writeSetting("cycle_stream", "1");
         stream = device->setupStream(SOAPY_SDR_RX, format);
         if (device->activateStream(stream) != 0) throw std::runtime_error("activateStream failed");
         std::vector<float> samples(16384 * 2);
