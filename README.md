@@ -1,6 +1,9 @@
 # SoapyESPSDR
 
-SoapyESPSDR is a receive-only SoapySDR driver for ESP-SDR.
+<a href="https://espargos.net/"><img src="assets/espargos-logo.png" alt="ESPARGOS" width="40%" align="right"></a>
+
+SoapyESPSDR is a receive-only SoapySDR driver for ESP-SDR by
+[ESPARGOS](https://espargos.net/).
 
 ESP-SDR is firmware for the ESP32-S31 Function-CoreBoard that provides a
 network-connected I/Q receiver over the board's Gigabit Ethernet interface.
@@ -10,6 +13,10 @@ SoapySDR, including Gqrx, GNU Radio, and SDR++.
 The driver uses HTTP to configure the radio and UDP to receive I/Q samples. It
 checks the firmware sequence numbers for missing samples and reports loss to
 the application as SoapySDR overflow events.
+
+![ESP-SDR receiving the 2.4 GHz band in Gqrx](assets/gqrx-esp-sdr.png)
+
+*ESP-SDR receiving the 2.4 GHz band in Gqrx at 20 MSa/s.*
 
 ## Requirements
 
