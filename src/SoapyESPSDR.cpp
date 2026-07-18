@@ -7,6 +7,7 @@
 
 #include <curl/curl.h>
 #include <json/json.h>
+#include <libusb-1.0/libusb.h>
 #include <zlib.h>
 
 #include <arpa/inet.h>
@@ -43,6 +44,27 @@ constexpr uint32_t UDP_VERSION = 1;
 constexpr unsigned ADC_CLOCK_HZ = 80'000'000;
 constexpr unsigned ADC_DECIMATION_MAX = 10;
 constexpr unsigned STREAM_SELECTION_MAX = 1'000'000;
+
+// USB transport: vendor interface on the ESP32-S31 native high-speed port.
+constexpr uint16_t USB_VID = 0x303A;
+constexpr uint16_t USB_PID = 0x4531;
+constexpr const char *USB_PRODUCT = "ESP-SDR";
+constexpr uint8_t USB_EP_CTRL_OUT = 0x01;
+constexpr uint8_t USB_EP_CTRL_IN = 0x81;
+constexpr uint8_t USB_EP_STREAM_IN = 0x82;
+constexpr std::size_t USB_CTRL_HEADER_BYTES = 16;
+constexpr std::size_t USB_CTRL_MAX_PAYLOAD = 2048;
+constexpr unsigned USB_CTRL_TIMEOUT_MS = 3000;
+constexpr int USB_STREAM_TRANSFERS = 16;
+constexpr std::size_t USB_STREAM_TRANSFER_BYTES = 16 * 1024;
+
+enum UsbControlOpcode : uint32_t {
+    USB_OP_GET_STATUS = 1,
+    USB_OP_GET_CONFIG = 2,
+    USB_OP_PUT_CONFIG = 3,
+    USB_OP_STREAM_START = 4,
+    USB_OP_STREAM_STOP = 5,
+};
 
 Json::Value intervalTrigger(unsigned total, unsigned streamed)
 {
@@ -177,6 +199,165 @@ private:
     unsigned _port;
 };
 
+// Abstract control plane: HTTP JSON API or the equivalent USB channel.
+class Control {
+public:
+    virtual ~Control() = default;
+    virtual Json::Value get(const std::string &path) = 0;
+    virtual Json::Value put(const std::string &path, const Json::Value &body) = 0;
+    virtual Json::Value post(const std::string &path, const Json::Value &body) = 0;
+};
+
+class HttpControl final : public Control {
+public:
+    HttpControl(std::string host, unsigned port): _http(std::move(host), port) {}
+    Json::Value get(const std::string &path) override { return _http.get(path); }
+    Json::Value put(const std::string &path, const Json::Value &body) override { return _http.put(path, body); }
+    Json::Value post(const std::string &path, const Json::Value &body) override { return _http.post(path, body); }
+
+private:
+    HttpClient _http;
+};
+
+struct UsbContext {
+    libusb_context *context = nullptr;
+    libusb_device_handle *handle = nullptr;
+    std::string serial;
+
+    ~UsbContext()
+    {
+        if (handle != nullptr) {
+            libusb_release_interface(handle, 0);
+            libusb_close(handle);
+        }
+        if (context != nullptr) libusb_exit(context);
+    }
+};
+
+std::string usbStringDescriptor(libusb_device_handle *handle, uint8_t index)
+{
+    if (index == 0) return {};
+    unsigned char text[128] = {0};
+    const int length = libusb_get_string_descriptor_ascii(handle, index, text, sizeof(text) - 1);
+    return length > 0 ? std::string(reinterpret_cast<char *>(text), length) : std::string();
+}
+
+// Open the ESP-SDR vendor device, optionally matching a specific serial.
+std::shared_ptr<UsbContext> usbOpen(const std::string &serial)
+{
+    auto usb = std::make_shared<UsbContext>();
+    if (libusb_init(&usb->context) != 0) throw std::runtime_error("libusb_init failed");
+    libusb_device **list = nullptr;
+    const ssize_t count = libusb_get_device_list(usb->context, &list);
+    std::string firstError = "no ESP-SDR USB device found";
+    for (ssize_t i = 0; i < count && usb->handle == nullptr; ++i) {
+        libusb_device_descriptor desc{};
+        if (libusb_get_device_descriptor(list[i], &desc) != 0) continue;
+        if (desc.idVendor != USB_VID || desc.idProduct != USB_PID) continue;
+        libusb_device_handle *handle = nullptr;
+        const int status = libusb_open(list[i], &handle);
+        if (status != 0) {
+            firstError = std::string("cannot open ESP-SDR USB device: ") + libusb_error_name(status);
+            continue;
+        }
+        const std::string product = usbStringDescriptor(handle, desc.iProduct);
+        const std::string deviceSerial = usbStringDescriptor(handle, desc.iSerialNumber);
+        if (product != USB_PRODUCT || (!serial.empty() && deviceSerial != serial)) {
+            libusb_close(handle);
+            continue;
+        }
+        libusb_set_auto_detach_kernel_driver(handle, 1);
+        const int claim = libusb_claim_interface(handle, 0);
+        if (claim != 0) {
+            libusb_close(handle);
+            firstError = std::string("cannot claim ESP-SDR USB interface: ") + libusb_error_name(claim);
+            continue;
+        }
+        usb->handle = handle;
+        usb->serial = deviceSerial;
+    }
+    if (list != nullptr) libusb_free_device_list(list, 1);
+    if (usb->handle == nullptr) throw std::runtime_error(firstError);
+    return usb;
+}
+
+class UsbControl final : public Control {
+public:
+    explicit UsbControl(std::shared_ptr<UsbContext> usb): _usb(std::move(usb)) {}
+
+    Json::Value get(const std::string &path) override
+    {
+        if (path == "/api/v1/status") return request(USB_OP_GET_STATUS, nullptr);
+        if (path == "/api/v1/config") return request(USB_OP_GET_CONFIG, nullptr);
+        throw std::runtime_error("unsupported USB control path: " + path);
+    }
+    Json::Value put(const std::string &path, const Json::Value &body) override
+    {
+        if (path == "/api/v1/config") return request(USB_OP_PUT_CONFIG, &body);
+        throw std::runtime_error("unsupported USB control path: " + path);
+    }
+    Json::Value post(const std::string &path, const Json::Value &body) override
+    {
+        (void)body; // the UDP port argument is meaningless on USB
+        if (path == "/api/v1/stream/start") return request(USB_OP_STREAM_START, nullptr);
+        if (path == "/api/v1/stream/stop") return request(USB_OP_STREAM_STOP, nullptr);
+        throw std::runtime_error("unsupported USB control path: " + path);
+    }
+
+private:
+    Json::Value request(uint32_t opcode, const Json::Value *body)
+    {
+        std::lock_guard<std::mutex> lock(_mutex);
+        std::string payload = body != nullptr ? jsonString(*body) : std::string();
+        if (payload.size() > USB_CTRL_MAX_PAYLOAD) throw std::runtime_error("USB control payload too large");
+        // Keep the request off exact packet-size multiples so the transfer
+        // always terminates with a short packet.
+        if ((USB_CTRL_HEADER_BYTES + payload.size()) % 512 == 0) payload.push_back(' ');
+        const uint32_t sequence = ++_sequence;
+        std::vector<uint8_t> out(USB_CTRL_HEADER_BYTES + payload.size());
+        std::memcpy(out.data(), "IQRQ", 4);
+        writeLe32(out.data() + 4, sequence);
+        writeLe32(out.data() + 8, opcode);
+        writeLe32(out.data() + 12, static_cast<uint32_t>(payload.size()));
+        std::memcpy(out.data() + USB_CTRL_HEADER_BYTES, payload.data(), payload.size());
+        int transferred = 0;
+        int status = libusb_bulk_transfer(_usb->handle, USB_EP_CTRL_OUT, out.data(),
+                                          static_cast<int>(out.size()), &transferred, USB_CTRL_TIMEOUT_MS);
+        if (status != 0 || transferred != static_cast<int>(out.size())) {
+            throw std::runtime_error(std::string("USB control write failed: ") + libusb_error_name(status));
+        }
+        std::vector<uint8_t> in(USB_CTRL_HEADER_BYTES + USB_CTRL_MAX_PAYLOAD + 64);
+        status = libusb_bulk_transfer(_usb->handle, USB_EP_CTRL_IN, in.data(),
+                                      static_cast<int>(in.size()), &transferred, USB_CTRL_TIMEOUT_MS);
+        if (status != 0 || transferred < static_cast<int>(USB_CTRL_HEADER_BYTES)) {
+            throw std::runtime_error(std::string("USB control read failed: ") + libusb_error_name(status));
+        }
+        if (std::memcmp(in.data(), "IQRS", 4) != 0 || le32(in.data() + 4) != sequence) {
+            throw std::runtime_error("USB control response out of sync");
+        }
+        const uint32_t errorStatus = le32(in.data() + 8);
+        const uint32_t payloadBytes = le32(in.data() + 12);
+        if (USB_CTRL_HEADER_BYTES + payloadBytes > static_cast<std::size_t>(transferred)) {
+            throw std::runtime_error("USB control response truncated");
+        }
+        const std::string text(reinterpret_cast<char *>(in.data()) + USB_CTRL_HEADER_BYTES, payloadBytes);
+        if (errorStatus != 0) throw std::runtime_error("ESP-SDR USB control error: " + text);
+        return text.empty() ? Json::Value(Json::objectValue) : parseJson(text);
+    }
+
+    static void writeLe32(uint8_t *p, uint32_t value)
+    {
+        p[0] = value & 0xff;
+        p[1] = (value >> 8) & 0xff;
+        p[2] = (value >> 16) & 0xff;
+        p[3] = (value >> 24) & 0xff;
+    }
+
+    std::shared_ptr<UsbContext> _usb;
+    std::mutex _mutex;
+    uint32_t _sequence = 0;
+};
+
 struct UdpHeader {
     uint32_t epoch = 0;
     uint32_t datagramSequence = 0;
@@ -233,6 +414,9 @@ struct StreamState {
     std::string format;
     int socketFd = -1;
     uint16_t port = 0;
+    std::shared_ptr<UsbContext> usb; // non-null when streaming over USB
+    std::vector<uint8_t> usbParseBuffer;
+    std::atomic<int> usbActiveTransfers{0};
     std::atomic<bool> active{false};
     std::atomic<bool> stop{false};
     std::thread worker;
@@ -269,13 +453,20 @@ public:
         _requestedUdpPort(parseUnsigned(valueOr(args, "udp_port", "0"), "udp_port", 0, 65535)),
         _rxBufferBytes(parseUnsigned(valueOr(args, "rx_buffer_bytes", "33554432"), "rx_buffer_bytes", 65536, 268435456)),
         _cycleTotal(parseUnsigned(valueOr(args, "cycle_total", "1"), "cycle_total", 1, STREAM_SELECTION_MAX)),
-        _cycleStream(parseUnsigned(valueOr(args, "cycle_stream", "1"), "cycle_stream", 1, STREAM_SELECTION_MAX)),
-        _http(_host, _httpPort)
+        _cycleStream(parseUnsigned(valueOr(args, "cycle_stream", "1"), "cycle_stream", 1, STREAM_SELECTION_MAX))
     {
         if (_cycleStream > _cycleTotal) throw std::runtime_error("cycle_stream must not exceed cycle_total");
-        _config = _http.get("/api/v1/config");
+        const std::string usbArg = valueOr(args, "usb", "");
+        const std::string usbSerial = valueOr(args, "usb_serial", "");
+        if ((!usbArg.empty() && usbArg != "0") || !usbSerial.empty()) {
+            _usb = usbOpen(usbSerial);
+            _control = std::make_unique<UsbControl>(_usb);
+        } else {
+            _control = std::make_unique<HttpControl>(_host, _httpPort);
+        }
+        _config = _control->get("/api/v1/config");
         if (!_config.isObject()) throw std::runtime_error("ESP-SDR returned an invalid configuration");
-        const Json::Value status = _http.get("/api/v1/status");
+        const Json::Value status = _control->get("/api/v1/status");
         const Json::Value gain = status["manual_rx_gain"];
         if (gain.isObject() && gain["unit"].asString() == "dB") {
             _gainMin = gain.get("minimum", 0.0).asDouble();
@@ -297,6 +488,10 @@ public:
     std::string getHardwareKey() const override { return "ESP-SDR"; }
     SoapySDR::Kwargs getHardwareInfo() const override
     {
+        if (_usb != nullptr) {
+            return {{"vendor", "Espressif"}, {"hardware", "ESP32-S31 Function-CoreBoard"},
+                    {"usb_serial", _usb->serial}, {"transport", "USB control / USB IQ"}};
+        }
         return {{"vendor", "Espressif"}, {"hardware", "ESP32-S31 Function-CoreBoard"},
                 {"host", _host}, {"transport", "HTTP control / UDP IQ"}};
     }
@@ -498,6 +693,11 @@ public:
         if (_stream != nullptr) throw std::runtime_error("only one RX stream is supported");
         auto state = std::make_unique<StreamState>();
         state->format = format;
+        if (_usb != nullptr) {
+            state->usb = _usb;
+            _stream = state.release();
+            return reinterpret_cast<SoapySDR::Stream *>(_stream);
+        }
         state->socketFd = ::socket(AF_INET, SOCK_DGRAM, 0);
         if (state->socketFd < 0) throw std::runtime_error("failed to create UDP socket");
         int reuse = 1;
@@ -563,11 +763,12 @@ public:
         }
         state->stop = false;
         state->active = true;
-        state->worker = std::thread(&EspDevice::receiveLoop, state);
+        state->worker = std::thread(state->usb != nullptr ? &EspDevice::usbReceiveLoop
+                                                          : &EspDevice::receiveLoop, state);
         Json::Value body;
         body["port"] = state->port;
         try {
-            _http.post("/api/v1/stream/start", body);
+            _control->post("/api/v1/stream/start", body);
         } catch (...) {
             state->stop = true;
             if (state->worker.joinable()) state->worker.join();
@@ -581,7 +782,7 @@ public:
         auto *state = checkedStream(stream);
         if (flags != 0) return SOAPY_SDR_NOT_SUPPORTED;
         if (!state->active) return 0;
-        try { _http.post("/api/v1/stream/stop", Json::Value(Json::objectValue)); }
+        try { _control->post("/api/v1/stream/stop", Json::Value(Json::objectValue)); }
         catch (const std::exception &error) { SoapySDR::logf(SOAPY_SDR_WARNING, "stream stop failed: %s", error.what()); }
         state->stop = true;
         if (state->worker.joinable()) state->worker.join();
@@ -740,12 +941,12 @@ private:
             stream->suppressContinuityUntilNs = monotonicNanoseconds() + 15'000'000'000ll;
         }
         try {
-            _http.put("/api/v1/config", patch);
+            _control->put("/api/v1/config", patch);
             const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
             while (std::chrono::steady_clock::now() < deadline) {
-                const Json::Value status = _http.get("/api/v1/status");
+                const Json::Value status = _control->get("/api/v1/status");
                 if (!status.get("config_applying", false).asBool()) {
-                    Json::Value applied = _http.get("/api/v1/config");
+                    Json::Value applied = _control->get("/api/v1/config");
                     if (jsonContains(applied, patch)) {
                         std::lock_guard<std::mutex> lock(_configMutex);
                         _config = std::move(applied);
@@ -896,13 +1097,79 @@ private:
         }
     }
 
+    // USB stream: a reliable byte stream of self-delimiting messages, each a
+    // 52-byte IQU1 header (fragment_count == 1) followed by the whole frame.
+    static void usbConsume(StreamState *state)
+    {
+        auto &buffer = state->usbParseBuffer;
+        std::size_t pos = 0;
+        while (buffer.size() - pos >= UDP_HEADER_BYTES) {
+            const uint8_t *p = buffer.data() + pos;
+            if (std::memcmp(p, "IQU1", 4) != 0 ||
+                le32(p + 48) != static_cast<uint32_t>(crc32(0, p, 48))) {
+                ++pos; // resync byte-wise on the next valid header
+                state->invalidDatagrams++;
+                continue;
+            }
+            const std::size_t total = UDP_HEADER_BYTES + le16(p + 36);
+            if (buffer.size() - pos < total) break;
+            handleDatagram(state, p, total);
+            pos += total;
+        }
+        buffer.erase(buffer.begin(), buffer.begin() + pos);
+    }
+
+    static void usbStreamCallback(libusb_transfer *transfer)
+    {
+        auto *state = static_cast<StreamState *>(transfer->user_data);
+        bool resubmit = false;
+        if (transfer->status == LIBUSB_TRANSFER_COMPLETED) {
+            state->usbParseBuffer.insert(state->usbParseBuffer.end(), transfer->buffer,
+                                         transfer->buffer + transfer->actual_length);
+            usbConsume(state);
+            resubmit = true;
+        }
+        if (resubmit && !state->stop && libusb_submit_transfer(transfer) == 0) return;
+        state->usbActiveTransfers--;
+    }
+
+    static void usbReceiveLoop(StreamState *state)
+    {
+        std::array<libusb_transfer *, USB_STREAM_TRANSFERS> transfers{};
+        std::vector<std::vector<uint8_t>> buffers(USB_STREAM_TRANSFERS,
+                                                  std::vector<uint8_t>(USB_STREAM_TRANSFER_BYTES));
+        for (int i = 0; i < USB_STREAM_TRANSFERS; ++i) {
+            transfers[i] = libusb_alloc_transfer(0);
+            libusb_fill_bulk_transfer(transfers[i], state->usb->handle, USB_EP_STREAM_IN,
+                                      buffers[i].data(), static_cast<int>(buffers[i].size()),
+                                      &EspDevice::usbStreamCallback, state, 0);
+            if (libusb_submit_transfer(transfers[i]) == 0) state->usbActiveTransfers++;
+        }
+        while (!state->stop) {
+            timeval tv{0, 100000};
+            libusb_handle_events_timeout(state->usb->context, &tv);
+        }
+        for (int i = 0; i < USB_STREAM_TRANSFERS; ++i) {
+            if (transfers[i] != nullptr) libusb_cancel_transfer(transfers[i]);
+        }
+        while (state->usbActiveTransfers > 0) {
+            timeval tv{0, 100000};
+            libusb_handle_events_timeout(state->usb->context, &tv);
+        }
+        for (auto *transfer : transfers) {
+            if (transfer != nullptr) libusb_free_transfer(transfer);
+        }
+        state->usbParseBuffer.clear();
+    }
+
     std::string _host;
     unsigned _httpPort;
     unsigned _requestedUdpPort;
     unsigned _rxBufferBytes;
     std::atomic<unsigned> _cycleTotal;
     std::atomic<unsigned> _cycleStream;
-    HttpClient _http;
+    std::shared_ptr<UsbContext> _usb;
+    std::unique_ptr<Control> _control;
     std::mutex _controlMutex;
     mutable std::mutex _configMutex;
     Json::Value _config;
@@ -912,10 +1179,50 @@ private:
     StreamState *_stream = nullptr;
 };
 
+std::vector<std::string> usbEnumerateSerials()
+{
+    std::vector<std::string> serials;
+    libusb_context *context = nullptr;
+    if (libusb_init(&context) != 0) return serials;
+    libusb_device **list = nullptr;
+    const ssize_t count = libusb_get_device_list(context, &list);
+    for (ssize_t i = 0; i < count; ++i) {
+        libusb_device_descriptor desc{};
+        if (libusb_get_device_descriptor(list[i], &desc) != 0) continue;
+        if (desc.idVendor != USB_VID || desc.idProduct != USB_PID) continue;
+        libusb_device_handle *handle = nullptr;
+        if (libusb_open(list[i], &handle) != 0) continue;
+        if (usbStringDescriptor(handle, desc.iProduct) == USB_PRODUCT) {
+            serials.push_back(usbStringDescriptor(handle, desc.iSerialNumber));
+        }
+        libusb_close(handle);
+    }
+    if (list != nullptr) libusb_free_device_list(list, 1);
+    libusb_exit(context);
+    return serials;
+}
+
 SoapySDR::KwargsList findEspSdr(const SoapySDR::Kwargs &args)
 {
     const auto driver = args.find("driver");
     if (driver != args.end() && driver->second != "espsdr") return {};
+
+    SoapySDR::KwargsList results;
+    const auto usbArg = args.find("usb");
+    const auto usbSerialArg = args.find("usb_serial");
+    const bool wantUsb = (usbArg != args.end() && usbArg->second != "0") || usbSerialArg != args.end();
+
+    for (const std::string &serial : usbEnumerateSerials()) {
+        if (usbSerialArg != args.end() && usbSerialArg->second != serial) continue;
+        SoapySDR::Kwargs result = args;
+        result["driver"] = "espsdr";
+        result["usb"] = "1";
+        result["usb_serial"] = serial;
+        result["label"] = "ESP-SDR USB (" + serial + ")";
+        results.push_back(std::move(result));
+    }
+    if (wantUsb) return results;
+
     SoapySDR::Kwargs result = args;
     result["driver"] = "espsdr";
     if (result.count("host") == 0) result["host"] = "esp-sdr.local";
@@ -925,11 +1232,11 @@ SoapySDR::KwargsList findEspSdr(const SoapySDR::Kwargs &args)
         const Json::Value status = http.get("/api/v1/status");
         result["label"] = "ESP-SDR (" + result["host"] + ")";
         if (status.isMember("ipv4")) result["ipv4"] = status["ipv4"].asString();
-        return {result};
+        results.push_back(std::move(result));
     } catch (const std::exception &error) {
         SoapySDR::logf(SOAPY_SDR_DEBUG, "SoapyESPSDR discovery at %s failed: %s", result["host"].c_str(), error.what());
-        return {};
     }
+    return results;
 }
 
 SoapySDR::Device *makeEspSdr(const SoapySDR::Kwargs &args) { return new EspDevice(args); }

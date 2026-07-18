@@ -7,11 +7,12 @@ find_package(CURL REQUIRED)
 find_package(PkgConfig REQUIRED)
 find_package(ZLIB REQUIRED)
 pkg_check_modules(JSONCPP REQUIRED IMPORTED_TARGET jsoncpp)
+pkg_check_modules(LIBUSB REQUIRED IMPORTED_TARGET libusb-1.0)
 
 SOAPY_SDR_MODULE_UTIL(
     TARGET ESPSDRSupport
     SOURCES src/SoapyESPSDR.cpp
-    LIBRARIES CURL::libcurl PkgConfig::JSONCPP ZLIB::ZLIB
+    LIBRARIES CURL::libcurl PkgConfig::JSONCPP ZLIB::ZLIB PkgConfig::LIBUSB
 )
 
 target_compile_features(ESPSDRSupport PRIVATE cxx_std_17)

@@ -61,6 +61,29 @@ Replace `esp-sdr.local` with an IPv4 address when necessary, for example:
 SoapySDRUtil --probe="driver=espsdr,host=192.168.0.139"
 ```
 
+## USB transport
+
+When the board's native high-speed USB port is connected, the same control
+and streaming interface is available without a network. USB devices are
+discovered automatically:
+
+```sh
+SoapySDRUtil --find="driver=espsdr"
+SoapySDRUtil --probe="driver=espsdr,usb=1"
+```
+
+Select a specific board with `usb_serial=<serial>` (the serial is the base
+MAC address, shown by `--find`). Only one sample stream runs at a time;
+starting a stream over USB replaces an Ethernet stream and vice versa.
+Continuous, lossless USB streaming is supported up to 8.89 MSa/s
+(decimation 9); higher rates stream best-effort with accurate loss
+counters, and the duty-cycle settings work as on Ethernet. Raw USB device
+access without root requires a udev rule for VID `303a`, for example:
+
+```text
+SUBSYSTEM=="usb", ATTRS{idVendor}=="303a", MODE="0664", GROUP="plugdev", TAG+="uaccess"
+```
+
 Install the module into the system SoapySDR module directory with:
 
 ```sh
