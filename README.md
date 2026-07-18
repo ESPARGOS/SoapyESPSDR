@@ -75,9 +75,14 @@ SoapySDRUtil --probe="driver=espsdr,usb=1"
 Select a specific board with `usb_serial=<serial>` (the serial is the base
 MAC address, shown by `--find`). Only one sample stream runs at a time;
 starting a stream over USB replaces an Ethernet stream and vice versa.
-Continuous, lossless USB streaming is supported up to 8.89 MSa/s
-(decimation 9); higher rates stream best-effort with accurate loss
-counters, and the duty-cycle settings work as on Ethernet. Raw USB device
+
+The `CS8` stream format (USB only) selects a compressed int8 wire format
+carrying the top 8 of each 10 sample bits, doubling the sustainable sample
+rate. Continuous, lossless USB streaming is supported up to 8.89 MSa/s
+(decimation 9) with `CS16`/`CF32` and up to 16 MSa/s (decimation 5) with
+`CS8`; higher rates (including 20 MSa/s `CS8`, ~88 % delivered) stream
+best-effort with accurate loss counters, and the duty-cycle settings work
+as on Ethernet. Raw USB device
 access without root requires a udev rule for VID `303a`, for example:
 
 ```text

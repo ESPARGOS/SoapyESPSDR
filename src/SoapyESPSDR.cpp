@@ -38,6 +38,9 @@ constexpr std::size_t UDP_HEADER_BYTES = 52;
 constexpr std::size_t IQ_HEADER_BYTES = 52;
 constexpr std::size_t IQ_SAMPLES = 1024;
 constexpr std::size_t IQ_FRAME_BYTES = IQ_HEADER_BYTES + IQ_SAMPLES * 4 + 4;
+// Compressed IQC8 frame: same header, interleaved int8 I/Q pairs (top 8 of
+// 10 sample bits), zero CRC field. USB transport only.
+constexpr std::size_t IQ8_FRAME_BYTES = IQ_HEADER_BYTES + IQ_SAMPLES * 2 + 4;
 constexpr std::size_t MAX_FRAME_BYTES = 64 * 1024;
 constexpr std::size_t MAX_QUEUE_BLOCKS = 512;
 constexpr uint32_t UDP_VERSION = 1;
@@ -55,8 +58,8 @@ constexpr uint8_t USB_EP_STREAM_IN = 0x82;
 constexpr std::size_t USB_CTRL_HEADER_BYTES = 16;
 constexpr std::size_t USB_CTRL_MAX_PAYLOAD = 2048;
 constexpr unsigned USB_CTRL_TIMEOUT_MS = 3000;
-constexpr int USB_STREAM_TRANSFERS = 16;
-constexpr std::size_t USB_STREAM_TRANSFER_BYTES = 16 * 1024;
+constexpr int USB_STREAM_TRANSFERS = 8;
+constexpr std::size_t USB_STREAM_TRANSFER_BYTES = 256 * 1024;
 
 enum UsbControlOpcode : uint32_t {
     USB_OP_GET_STATUS = 1,
@@ -298,8 +301,9 @@ public:
     }
     Json::Value post(const std::string &path, const Json::Value &body) override
     {
-        (void)body; // the UDP port argument is meaningless on USB
-        if (path == "/api/v1/stream/start") return request(USB_OP_STREAM_START, nullptr);
+        // The UDP port argument is meaningless on USB, but the stream-start
+        // body also carries the wire-format selection.
+        if (path == "/api/v1/stream/start") return request(USB_OP_STREAM_START, &body);
         if (path == "/api/v1/stream/stop") return request(USB_OP_STREAM_STOP, nullptr);
         throw std::runtime_error("unsupported USB control path: " + path);
     }
@@ -675,6 +679,7 @@ public:
     std::vector<std::string> getStreamFormats(const int direction, const std::size_t channel) const override
     {
         checkRx(direction, channel);
+        if (_usb != nullptr) return {SOAPY_SDR_CS16, SOAPY_SDR_CF32, SOAPY_SDR_CS8};
         return {SOAPY_SDR_CS16, SOAPY_SDR_CF32};
     }
     std::string getNativeStreamFormat(const int direction, const std::size_t channel, double &fullScale) const override
@@ -689,7 +694,11 @@ public:
     {
         checkRx(direction, channels.empty() ? 0 : channels.front());
         if (channels.size() > 1) throw std::runtime_error("SoapyESPSDR has one RX channel");
-        if (format != SOAPY_SDR_CS16 && format != SOAPY_SDR_CF32) throw std::runtime_error("supported formats are CS16 and CF32");
+        if (format == SOAPY_SDR_CS8) {
+            if (_usb == nullptr) throw std::runtime_error("CS8 (compressed int8 wire format) requires the USB transport");
+        } else if (format != SOAPY_SDR_CS16 && format != SOAPY_SDR_CF32) {
+            throw std::runtime_error("supported formats are CS16, CF32, and CS8 (USB only)");
+        }
         if (_stream != nullptr) throw std::runtime_error("only one RX stream is supported");
         auto state = std::make_unique<StreamState>();
         state->format = format;
@@ -767,6 +776,7 @@ public:
                                                           : &EspDevice::receiveLoop, state);
         Json::Value body;
         body["port"] = state->port;
+        body["stream_format"] = state->format == SOAPY_SDR_CS8 ? 1 : 0;
         try {
             _control->post("/api/v1/stream/start", body);
         } catch (...) {
@@ -815,6 +825,9 @@ public:
             if (state->format == SOAPY_SDR_CS16) {
                 auto *output = static_cast<int16_t *>(buffers[0]);
                 std::memcpy(output + produced * 2, block.iq.data() + block.offset * 2, count * 2 * sizeof(int16_t));
+            } else if (state->format == SOAPY_SDR_CS8) {
+                auto *output = static_cast<int8_t *>(buffers[0]);
+                for (std::size_t i = 0; i < count * 2; ++i) output[produced * 2 + i] = int8_t(block.iq[block.offset * 2 + i] / 4);
             } else {
                 auto *output = static_cast<float *>(buffers[0]);
                 for (std::size_t i = 0; i < count * 2; ++i) output[produced * 2 + i] = block.iq[block.offset * 2 + i] / 512.0f;
@@ -975,19 +988,29 @@ private:
     }
     static void finishFrame(StreamState *state, PendingFrame &&pending)
     {
-        if (!validFrame(pending) || pending.data.size() != IQ_FRAME_BYTES || std::memcmp(pending.data.data(), "IQC1", 4) != 0) {
+        const bool full = pending.data.size() == IQ_FRAME_BYTES && std::memcmp(pending.data.data(), "IQC1", 4) == 0;
+        const bool compressed = pending.data.size() == IQ8_FRAME_BYTES && std::memcmp(pending.data.data(), "IQC8", 4) == 0;
+        if (!validFrame(pending) || (!full && !compressed)) {
             state->invalidDatagrams++;
             return;
         }
         const uint32_t source = le32(pending.data.data() + 8);
         SampleBlock block;
         const uint8_t *sampleData = pending.data.data() + IQ_HEADER_BYTES;
-        for (std::size_t i = 0; i < IQ_SAMPLES; ++i) {
-            const uint32_t word = le32(sampleData + i * 4);
-            // The dump word stores Q in bits 9:0 and I in bits 19:10.
-            // Soapy complex formats are interleaved I,Q.
-            block.iq[i * 2] = signExtend10(word >> 10);
-            block.iq[i * 2 + 1] = signExtend10(word);
+        if (compressed) {
+            // Interleaved int8 I,Q pairs holding the top 8 of 10 sample
+            // bits; scale to the canonical 10-bit range.
+            for (std::size_t i = 0; i < IQ_SAMPLES * 2; ++i) {
+                block.iq[i] = int16_t(int8_t(sampleData[i])) * 4;
+            }
+        } else {
+            for (std::size_t i = 0; i < IQ_SAMPLES; ++i) {
+                const uint32_t word = le32(sampleData + i * 4);
+                // The dump word stores Q in bits 9:0 and I in bits 19:10.
+                // Soapy complex formats are interleaved I,Q.
+                block.iq[i * 2] = signExtend10(word >> 10);
+                block.iq[i * 2 + 1] = signExtend10(word);
+            }
         }
         std::lock_guard<std::mutex> lock(state->mutex);
         const bool suppressContinuity = monotonicNanoseconds() < state->suppressContinuityUntilNs.load();
@@ -1027,7 +1050,8 @@ private:
         state->datagrams++;
         UdpHeader header;
         if (!parseHeader(data, bytes, header)) { state->invalidDatagrams++; return; }
-        if (std::memcmp(header.frameMagic.data(), "IQC1", 4) != 0) return;
+        if (std::memcmp(header.frameMagic.data(), "IQC1", 4) != 0 &&
+            std::memcmp(header.frameMagic.data(), "IQC8", 4) != 0) return;
         if (!state->haveEpoch || state->epoch != header.epoch) {
             std::lock_guard<std::mutex> lock(state->mutex);
             state->epoch = header.epoch;
