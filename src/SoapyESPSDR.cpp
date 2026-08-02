@@ -477,6 +477,13 @@ public:
             _gainMax = gain.get("maximum", 76.0).asDouble();
             _gainStep = gain.get("step", 1.0).asDouble();
         }
+        const auto correction = args.find("frequency_correction_ppm");
+        if (correction != args.end()) {
+            setFrequencyCorrection(SOAPY_SDR_RX, 0,
+                                   parseDouble(correction->second,
+                                               "frequency_correction_ppm",
+                                               -100.0, 100.0));
+        }
         applyDutyCycle(_cycleTotal, _cycleStream);
     }
 
@@ -579,6 +586,29 @@ public:
         return {{2.3e9, 2.8e9, 1000}};
     }
 
+    bool hasFrequencyCorrection(const int direction, const std::size_t channel) const override
+    {
+        checkRx(direction, channel);
+        return true;
+    }
+    void setFrequencyCorrection(const int direction, const std::size_t channel,
+                                const double value) override
+    {
+        checkRx(direction, channel);
+        if (!std::isfinite(value) || value < -100.0 || value > 100.0)
+            throw std::runtime_error("frequency correction must be -100..100 ppm");
+        Json::Value patch;
+        patch["radio"]["frequency_correction_ppb"] =
+            Json::Int64(std::llround(value * 1000.0));
+        applyPatch(patch);
+    }
+    double getFrequencyCorrection(const int direction,
+                                  const std::size_t channel) const override
+    {
+        checkRx(direction, channel);
+        return configInt64("radio", "frequency_correction_ppb", 0) / 1000.0;
+    }
+
     void setSampleRate(const int direction, const std::size_t channel, const double rate) override
     {
         checkRx(direction, channel);
@@ -619,7 +649,85 @@ public:
         streamed.key = "cycle_stream";
         streamed.name = "Duty cycle: streamed chunks";
         streamed.description = "Number of contiguous chunks streamed at the start of each capture cycle";
-        return {total, streamed};
+
+        SoapySDR::ArgInfo correction;
+        correction.key = "frequency_correction_ppm";
+        correction.value = "0";
+        correction.name = "Frequency correction";
+        correction.description = "Board reference correction; positive means the ESP receiver LO runs high";
+        correction.units = "ppm";
+        correction.type = SoapySDR::ArgInfo::FLOAT;
+        correction.range = SoapySDR::Range(-100, 100);
+
+        SoapySDR::ArgInfo filterOverride;
+        filterOverride.key = "rx_filter_override";
+        filterOverride.value = "0";
+        filterOverride.name = "Expert RX filter override";
+        filterOverride.description = "0=calibrated, 1=raw Wi-Fi, 2..35=BT probes, 36/37=Wi-Fi byte-pair probes";
+        filterOverride.type = SoapySDR::ArgInfo::INT;
+        filterOverride.range = SoapySDR::Range(0, 37, 1);
+
+        SoapySDR::ArgInfo filterMode;
+        filterMode.key = "rx_filter_mode";
+        filterMode.value = "32";
+        filterMode.name = "Expert RX filter mode";
+        filterMode.description = "Expert mode; BT probes use 0..31 for byte pairs and 32 for vendor BT packing";
+        filterMode.type = SoapySDR::ArgInfo::INT;
+        filterMode.range = SoapySDR::Range(0, 32, 1);
+
+        SoapySDR::ArgInfo filterDcap;
+        filterDcap.key = "rx_filter_dcap";
+        filterDcap.value = "60";
+        filterDcap.name = "Expert RX filter DCap";
+        filterDcap.description = "Raw 6-bit Wi-Fi RX analog filter capacitor-DAC code";
+        filterDcap.type = SoapySDR::ArgInfo::INT;
+        filterDcap.range = SoapySDR::Range(0, 63, 1);
+
+        SoapySDR::ArgInfo adcSource;
+        adcSource.key = "adc_source_sel";
+        adcSource.value = "3";
+        adcSource.name = "Expert ADC dump source";
+        adcSource.description = "Raw S31 ADC dump source mux (low four bits)";
+        adcSource.type = SoapySDR::ArgInfo::INT;
+        adcSource.range = SoapySDR::Range(0, 15, 1);
+
+        SoapySDR::ArgInfo loopback;
+        loopback.key = "diag_loopback";
+        loopback.value = "0";
+        loopback.name = "Diagnostic internal loopback";
+        loopback.type = SoapySDR::ArgInfo::BOOL;
+
+        SoapySDR::ArgInfo toneEnable = loopback;
+        toneEnable.key = "diag_tx_tone_enable";
+        toneEnable.name = "Diagnostic TX tone";
+
+        SoapySDR::ArgInfo toneStep;
+        toneStep.key = "diag_tx_tone_step";
+        toneStep.value = "16";
+        toneStep.name = "Diagnostic TX tone step";
+        toneStep.type = SoapySDR::ArgInfo::INT;
+        toneStep.range = SoapySDR::Range(0, 100, 1);
+
+        SoapySDR::ArgInfo loopTxGain;
+        loopTxGain.key = "diag_loopback_tx_gain";
+        loopTxGain.value = "124";
+        loopTxGain.name = "Diagnostic loopback TX gain";
+        loopTxGain.type = SoapySDR::ArgInfo::INT;
+        loopTxGain.range = SoapySDR::Range(0, 255, 1);
+
+        SoapySDR::ArgInfo loopRxGain = loopTxGain;
+        loopRxGain.key = "diag_loopback_rx_gain";
+        loopRxGain.value = "115";
+        loopRxGain.name = "Diagnostic loopback RX gain";
+        loopRxGain.range = SoapySDR::Range(0, 127, 1);
+
+        SoapySDR::ArgInfo loopBbGain = loopRxGain;
+        loopBbGain.key = "diag_loopback_bb_gain";
+        loopBbGain.value = "63";
+        loopBbGain.name = "Diagnostic loopback BB gain";
+
+        return {total, streamed, correction, filterOverride, filterMode, filterDcap, adcSource,
+                loopback, toneEnable, toneStep, loopTxGain, loopRxGain, loopBbGain};
     }
     void writeSetting(const std::string &key, const std::string &value) override
     {
@@ -631,6 +739,62 @@ public:
         } else if (key == "cycle_stream") {
             streamed = parseUnsigned(value, "cycle_stream", 1, STREAM_SELECTION_MAX);
             if (streamed > total) throw std::runtime_error("cycle_stream must not exceed cycle_total");
+        } else if (key == "frequency_correction_ppm") {
+            setFrequencyCorrection(SOAPY_SDR_RX, 0,
+                                   parseDouble(value, "frequency_correction_ppm",
+                                               -100.0, 100.0));
+            return;
+        } else if (key == "rx_filter_override") {
+            Json::Value patch;
+            patch["rx_filter"]["rx_filter_override"] = parseUnsigned(value, "rx_filter_override", 0, 37);
+            applyPatch(patch);
+            return;
+        } else if (key == "rx_filter_mode") {
+            Json::Value patch;
+            patch["rx_filter"]["rx_filter_mode"] = parseUnsigned(value, "rx_filter_mode", 0, 32);
+            applyPatch(patch);
+            return;
+        } else if (key == "rx_filter_dcap") {
+            Json::Value patch;
+            patch["rx_filter"]["rx_filter_dcap"] = parseUnsigned(value, "rx_filter_dcap", 0, 63);
+            applyPatch(patch);
+            return;
+        } else if (key == "adc_source_sel") {
+            Json::Value patch;
+            const unsigned source = parseUnsigned(value, "adc_source_sel", 0, 15);
+            patch["iq_engine"]["adc_source_sel"] = 0x08080000u | source;
+            applyPatch(patch);
+            return;
+        } else if (key == "diag_loopback") {
+            Json::Value patch;
+            patch["loopback"]["loopback"] = parseUnsigned(value, "diag_loopback", 0, 1);
+            applyPatch(patch);
+            return;
+        } else if (key == "diag_tx_tone_enable") {
+            Json::Value patch;
+            patch["tx"]["tx_tone_enable"] = parseUnsigned(value, "diag_tx_tone_enable", 0, 1);
+            applyPatch(patch);
+            return;
+        } else if (key == "diag_tx_tone_step") {
+            Json::Value patch;
+            patch["tx"]["tx_tone0_step"] = parseUnsigned(value, "diag_tx_tone_step", 0, 100);
+            applyPatch(patch);
+            return;
+        } else if (key == "diag_loopback_tx_gain") {
+            Json::Value patch;
+            patch["loopback"]["loopback_tx_gain"] = parseUnsigned(value, "diag_loopback_tx_gain", 0, 255);
+            applyPatch(patch);
+            return;
+        } else if (key == "diag_loopback_rx_gain") {
+            Json::Value patch;
+            patch["loopback"]["loopback_rx_gain"] = parseUnsigned(value, "diag_loopback_rx_gain", 0, 127);
+            applyPatch(patch);
+            return;
+        } else if (key == "diag_loopback_bb_gain") {
+            Json::Value patch;
+            patch["loopback"]["loopback_bb_gain"] = parseUnsigned(value, "diag_loopback_bb_gain", 0, 127);
+            applyPatch(patch);
+            return;
         } else {
             throw std::runtime_error("unknown setting: " + key);
         }
@@ -640,6 +804,18 @@ public:
     {
         if (key == "cycle_total") return std::to_string(_cycleTotal.load());
         if (key == "cycle_stream") return std::to_string(_cycleStream.load());
+        if (key == "frequency_correction_ppm") return std::to_string(
+            getFrequencyCorrection(SOAPY_SDR_RX, 0));
+        if (key == "rx_filter_override") return std::to_string(configUInt("rx_filter", "rx_filter_override", 0));
+        if (key == "rx_filter_mode") return std::to_string(configUInt("rx_filter", "rx_filter_mode", 16));
+        if (key == "rx_filter_dcap") return std::to_string(configUInt("rx_filter", "rx_filter_dcap", 60));
+        if (key == "adc_source_sel") return std::to_string(configUInt("iq_engine", "adc_source_sel", 3) & 15u);
+        if (key == "diag_loopback") return std::to_string(configUInt("loopback", "loopback", 0));
+        if (key == "diag_tx_tone_enable") return std::to_string(configUInt("tx", "tx_tone_enable", 0));
+        if (key == "diag_tx_tone_step") return std::to_string(configUInt("tx", "tx_tone0_step", 16));
+        if (key == "diag_loopback_tx_gain") return std::to_string(configUInt("loopback", "loopback_tx_gain", 124));
+        if (key == "diag_loopback_rx_gain") return std::to_string(configUInt("loopback", "loopback_rx_gain", 115));
+        if (key == "diag_loopback_bb_gain") return std::to_string(configUInt("loopback", "loopback_bb_gain", 63));
         throw std::runtime_error("unknown setting: " + key);
     }
 
@@ -649,7 +825,8 @@ public:
         unsigned mhz = 0;
         if (bandwidth != 0) {
             mhz = static_cast<unsigned>(std::llround(bandwidth / 1e6));
-            if (mhz < 13 || mhz > 54) throw std::runtime_error("bandwidth must be 0/open or 13-54 MHz");
+            if (mhz < 13 || mhz > 54)
+                throw std::runtime_error("bandwidth must be 0/open or 13-54 MHz");
         }
         Json::Value patch;
         patch["bandwidth"]["bw_mhz"] = 20;
@@ -842,7 +1019,8 @@ public:
     std::vector<std::string> listSensors() const override
     {
         return {"datagrams", "invalid_datagrams", "completed_frames", "lost_chunks",
-                "firmware_drops", "queue_drops", "capture_restarts"};
+                "firmware_drops", "queue_drops", "capture_restarts",
+                "adc_dump_cfg", "adc_dump_mode"};
     }
     SoapySDR::ArgInfo getSensorInfo(const std::string &key) const override
     {
@@ -863,6 +1041,10 @@ public:
         if (key == "firmware_drops") return std::to_string(state->firmwareDrops.load());
         if (key == "queue_drops") return std::to_string(state->queueDrops.load());
         if (key == "capture_restarts") return std::to_string(state->captureRestarts.load());
+        if (key == "adc_dump_cfg" || key == "adc_dump_mode") {
+            const Json::Value status = _control->get("/api/v1/status");
+            return std::to_string(status[key].asUInt());
+        }
         throw std::runtime_error("unknown sensor: " + key);
     }
 
@@ -878,6 +1060,16 @@ private:
         const unsigned long value = std::stoul(text, &consumed, 0);
         if (consumed != text.size() || value < minimum || value > maximum) throw std::runtime_error(std::string(name) + " is out of range");
         return static_cast<unsigned>(value);
+    }
+    static double parseDouble(const std::string &text, const char *name,
+                              double minimum, double maximum)
+    {
+        std::size_t consumed = 0;
+        const double value = std::stod(text, &consumed);
+        if (consumed != text.size() || !std::isfinite(value) ||
+            value < minimum || value > maximum)
+            throw std::runtime_error(std::string(name) + " is out of range");
+        return value;
     }
     static void checkRx(const int direction, const std::size_t channel)
     {
@@ -940,6 +1132,12 @@ private:
         std::lock_guard<std::mutex> lock(_configMutex);
         const Json::Value &value = _config[group][key];
         return value.isNumeric() ? value.asUInt64() : fallback;
+    }
+    int64_t configInt64(const char *group, const char *key, int64_t fallback) const
+    {
+        std::lock_guard<std::mutex> lock(_configMutex);
+        const Json::Value &value = _config[group][key];
+        return value.isNumeric() ? value.asInt64() : fallback;
     }
     unsigned configUInt(const char *group, const char *key, unsigned fallback) const
     {
@@ -1006,7 +1204,8 @@ private:
         } else {
             for (std::size_t i = 0; i < IQ_SAMPLES; ++i) {
                 const uint32_t word = le32(sampleData + i * 4);
-                // The dump word stores Q in bits 9:0 and I in bits 19:10.
+                // The dump word stores Q in bits 9:0 and I in bits 19:10;
+                // bits 27:20 carry gain and bits 31:28 carry AGC state.
                 // Soapy complex formats are interleaved I,Q.
                 block.iq[i * 2] = signExtend10(word >> 10);
                 block.iq[i * 2 + 1] = signExtend10(word);

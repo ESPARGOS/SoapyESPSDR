@@ -111,6 +111,13 @@ With an explicit address, the string looks like:
 soapy=0,driver=espsdr,host=192.168.0.139
 ```
 
+Apply a measured board-reference correction in ppm in the same string. For the
+bench board characterized against a PlutoSDR, use:
+
+```text
+soapy=0,driver=espsdr,host=192.168.0.139,frequency_correction_ppm=8.272
+```
+
 Select 8 or 16 MSa/s for continuous, lossless streaming. At higher sample
 rates, use the **Duty cycle** device settings to reduce the network data
 rate. If the module is not installed system-wide, launch Gqrx from the terminal
@@ -120,6 +127,7 @@ in which `SOAPY_SDR_PLUGIN_PATH` was exported.
 
 - `CS16` native I/Q samples and `CF32` converted samples
 - Center frequencies from 2300 to 2800 MHz, with 1 kHz tuning resolution
+- Signed frontend frequency correction from -100 to +100 ppm
 - Sample rates from 8 to 80 MSa/s, corresponding to integer software
   decimation factors from 10 to 1
 - Automatic or manual receive gain
@@ -170,9 +178,16 @@ geometry matters in addition to average data rate: use the listed values or a
 lower duty cycle, and monitor the loss sensors when using a different geometry.
 
 The analog bandwidth control uses the firmware's Custom/20 MHz digital channel
-path. A bandwidth of zero selects the open/widest analog response; nonzero
-values are rounded to whole MHz and must be between 13 and 54 MHz. ESP-SDR does
-not support the 40 MHz digital channel mode.
+path. A bandwidth of zero selects the open/widest response; nonzero values are
+rounded to whole MHz and must be between 13 and 54 MHz. ESP-SDR does not support
+the 40 MHz digital channel mode. Bluetooth-width routes remain expert-only
+because the filter response verified with the internal TX loop did not carry
+antenna-side RF when used as a continuous production source.
+
+For characterization, the device settings `rx_filter_override`,
+`rx_filter_mode`, `rx_filter_dcap`, and `adc_source_sel` expose the firmware's
+raw expert filter and dump-mux controls. Leave `rx_filter_override=0` for the
+calibrated bandwidth API.
 
 ## Monitoring sample loss
 
@@ -217,6 +232,7 @@ The SoapySDR device string accepts these arguments:
 | `rx_buffer_bytes` | `33554432` | Requested operating-system UDP receive-buffer size. |
 | `cycle_total` | `1` | Total chunks per duty-cycle period. |
 | `cycle_stream` | `1` | Contiguous streamed chunks at the start of each period. |
+| `frequency_correction_ppm` | `0` | Board-specific signed oscillator correction; positive means the ESP LO runs high. |
 
 ## Limitations
 

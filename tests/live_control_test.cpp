@@ -15,6 +15,7 @@ int main(int argc, char **argv)
     SoapySDR::Device *device = SoapySDR::Device::make("driver=espsdr,host=" + std::string(argv[1]));
     if (device == nullptr) return 1;
     const double oldFrequency = device->getFrequency(SOAPY_SDR_RX, 0);
+    const double oldCorrection = device->getFrequencyCorrection(SOAPY_SDR_RX, 0);
     const double oldBandwidth = device->getBandwidth(SOAPY_SDR_RX, 0);
     const double oldGain = device->getGain(SOAPY_SDR_RX, 0);
     const bool oldAgc = device->getGainMode(SOAPY_SDR_RX, 0);
@@ -24,11 +25,17 @@ int main(int argc, char **argv)
     try {
         std::cout << "set frequency\n";
         device->setFrequency(SOAPY_SDR_RX, 0, 2437125000.0);
+        std::cout << "set frequency correction\n";
+        if (!device->hasFrequencyCorrection(SOAPY_SDR_RX, 0))
+            throw std::runtime_error("frequency correction is not advertised");
+        device->setFrequencyCorrection(SOAPY_SDR_RX, 0, 8.272);
         std::cout << "set bandwidth\n";
         device->setBandwidth(SOAPY_SDR_RX, 0, 21e6);
         std::cout << "set gain\n";
         device->setGain(SOAPY_SDR_RX, 0, 40);
         if (device->getFrequency(SOAPY_SDR_RX, 0) != 2437125000.0) throw std::runtime_error("frequency readback mismatch");
+        if (std::abs(device->getFrequencyCorrection(SOAPY_SDR_RX, 0) - 8.272) > 0.0005)
+            throw std::runtime_error("frequency-correction readback mismatch");
         if (device->getBandwidth(SOAPY_SDR_RX, 0) != 21e6) throw std::runtime_error("bandwidth readback mismatch");
         if (device->getGain(SOAPY_SDR_RX, 0) != 40) throw std::runtime_error("gain readback mismatch");
         std::cout << "set duty cycle\n";
@@ -38,13 +45,14 @@ int main(int argc, char **argv)
             device->readSetting("cycle_stream") != "2") throw std::runtime_error("duty-cycle readback mismatch");
         const std::vector<double> rates = device->listSampleRates(SOAPY_SDR_RX, 0);
         if (rates.empty() || rates.front() != 8e6 || rates.back() != 80e6) throw std::runtime_error("sample-rate list mismatch");
-        std::cout << "frequency, analog bandwidth, gain, duty cycle, and sample rates: OK\n";
+        std::cout << "frequency, correction, analog bandwidth, gain, duty cycle, and sample rates: OK\n";
     } catch (const std::exception &error) {
         std::cerr << error.what() << '\n';
         result = 1;
     }
     try {
         device->setFrequency(SOAPY_SDR_RX, 0, oldFrequency);
+        device->setFrequencyCorrection(SOAPY_SDR_RX, 0, oldCorrection);
         device->setBandwidth(SOAPY_SDR_RX, 0, oldBandwidth);
         device->setGain(SOAPY_SDR_RX, 0, oldGain);
         device->setGainMode(SOAPY_SDR_RX, 0, oldAgc);
