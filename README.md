@@ -5,8 +5,8 @@
 SoapyESPSDR is a receive-only SoapySDR driver for ESP-SDR by
 [ESPARGOS](https://espargos.net/).
 
-ESP-SDR is firmware for the ESP32-S31 Function-CoreBoard that provides a
-network-connected I/Q receiver over the board's Gigabit Ethernet interface.
+ESP-SDR is firmware for the ESP32-S31 Function-CoreBoard that provides an I/Q
+receiver over either Gigabit Ethernet or the native high-speed USB interface.
 SoapyESPSDR makes that receiver available to applications that support
 SoapySDR, including Gqrx, GNU Radio, and SDR++.
 
@@ -16,7 +16,7 @@ the application as SoapySDR overflow events.
 
 ![ESP-SDR receiving the 2.4 GHz band in Gqrx](assets/gqrx-esp-sdr.png)
 
-*ESP-SDR receiving the 2.4 GHz band in Gqrx at 20 MSa/s.*
+*ESP-SDR receiving the 2.4 GHz band in Gqrx.*
 
 ## Requirements
 
@@ -77,12 +77,9 @@ MAC address, shown by `--find`). Only one sample stream runs at a time;
 starting a stream over USB replaces an Ethernet stream and vice versa.
 
 The `CS8` stream format (USB only) selects a compressed int8 wire format
-carrying the top 8 of each 10 sample bits, doubling the sustainable sample
-rate. Continuous, lossless USB streaming is supported up to 8.89 MSa/s
-(decimation 9) with `CS16`/`CF32` and up to 16 MSa/s (decimation 5) with
-`CS8`; higher rates (including 20 MSa/s `CS8`, ~88 % delivered) stream
-best-effort with accurate loss counters, and the duty-cycle settings work
-as on Ethernet. Raw USB device
+carrying the top 8 of each 10 sample bits. The verified hardware sample rates
+are 3.333, 4.000, 6.667, and 8.000 MSa/s; 4 MSa/s CS16 is the production
+default and is sustainable by the USB transport. Raw USB device
 access without root requires a udev rule for VID `303a`, for example:
 
 ```text
@@ -111,6 +108,12 @@ With an explicit address, the string looks like:
 soapy=0,driver=espsdr,host=192.168.0.139
 ```
 
+For native USB use:
+
+```text
+soapy=0,driver=espsdr,usb=1
+```
+
 Apply a measured board-reference correction in ppm in the same string. For the
 bench board characterized against a PlutoSDR, use:
 
@@ -118,18 +121,26 @@ bench board characterized against a PlutoSDR, use:
 soapy=0,driver=espsdr,host=192.168.0.139,frequency_correction_ppm=8.272
 ```
 
-Select 8 or 16 MSa/s for continuous, lossless streaming. At higher sample
-rates, use the **Duty cycle** device settings to reduce the network data
-rate. If the module is not installed system-wide, launch Gqrx from the terminal
-in which `SOAPY_SDR_PLUGIN_PATH` was exported.
+The corresponding USB string is:
+
+```text
+soapy=0,driver=espsdr,usb=1,frequency_correction_ppm=8.272
+```
+
+Select 4 MSa/s for the best validated full-precision mode. The firmware reports
+TCM source discontinuities as SoapySDR overflows; it does not silently repeat
+stale samples. If the module is not installed system-wide, launch Gqrx with:
+
+```sh
+SOAPY_SDR_PLUGIN_PATH=/home/florian/prgm/esp32/SoapyESPSDR/build gqrx
+```
 
 ## Supported controls and formats
 
 - `CS16` native I/Q samples and `CF32` converted samples
 - Center frequencies from 2300 to 2800 MHz, with 1 kHz tuning resolution
 - Signed frontend frequency correction from -100 to +100 ppm
-- Sample rates from 8 to 80 MSa/s, corresponding to integer software
-  decimation factors from 10 to 1
+- Verified hardware sample rates of 3.333, 4.000, 6.667, and 8.000 MSa/s
 - Automatic or manual receive gain
 - Manual receive gain from 0 to 76 dB in 1 dB steps
 - Open/widest or 13–54 MHz analog receive-filter bandwidth
@@ -138,9 +149,10 @@ Manual gain selects the ESP32-S31 PHY's calibrated receive-gain table. The
 firmware publishes the available range, unit, and step through its status API,
 and SoapyESPSDR reports those values to applications.
 
-ESP-SDR supports continuous, lossless streaming at 8 and 16 MSa/s. Higher rates
-are available for captures with a reduced duty cycle; missing samples caused by
-network or receiver overload are reported as overflows.
+The transport preserves frame ordering and reports missing source chunks,
+firmware drops, and host-queue loss as overflow events. The present S31 TCM
+handoff has one reported source discontinuity per 14-frame full-duty snapshot;
+sparse windows remain contiguous internally.
 
 The `cycle_total` and `cycle_stream` settings control capture duty cycle in
 units of 1,024-sample chunks. For example, `cycle_total=10,cycle_stream=3`
@@ -155,27 +167,9 @@ device is opened:
 soapy=0,driver=espsdr,host=esp-sdr.local,cycle_total=10,cycle_stream=3
 ```
 
-The following duty-cycle settings support continuous reception of every
-selected chunk. The average streamed rate accounts for the deliberately
-unstreamed part of each cycle.
-
-| Sample rate | Software decimation | `cycle_total` | `cycle_stream` | Duty cycle | Average streamed rate |
-| ---: | ---: | ---: | ---: | ---: | ---: |
-| 8 MSa/s | 10 | 1 | 1 | 100% | 8 MSa/s |
-| 8.889 MSa/s | 9 | 1 | 1 | 100% | 8.889 MSa/s |
-| 10 MSa/s | 8 | 1 | 1 | 100% | 10 MSa/s |
-| 11.429 MSa/s | 7 | 1 | 1 | 100% | 11.429 MSa/s |
-| 13.333 MSa/s | 6 | 1 | 1 | 100% | 13.333 MSa/s |
-| 16 MSa/s | 5 | 1 | 1 | 100% | 16 MSa/s |
-| 20 MSa/s | 4 | 2 | 1 | 50% | 10 MSa/s |
-| 26.667 MSa/s | 3 | 3 | 1 | 33.333% | 8.889 MSa/s |
-| 40 MSa/s | 2 | 4 | 1 | 25% | 10 MSa/s |
-| 80 MSa/s | 1 | 8 | 1 | 12.5% | 10 MSa/s |
-
-These cycle geometries were validated end-to-end with zero firmware drops,
-missing selected chunks, host queue drops, or SoapySDR overflow events. Cycle
-geometry matters in addition to average data rate: use the listed values or a
-lower duty cycle, and monitor the loss sensors when using a different geometry.
+Duty-cycle settings remain useful for sparse acquisitions. Monitor the loss
+sensors for every geometry; deliberately unselected chunks are distinct from
+unexpected source or transport loss.
 
 The analog bandwidth control uses the firmware's Custom/20 MHz digital channel
 path. A bandwidth of zero selects the open/widest response; nonzero values are

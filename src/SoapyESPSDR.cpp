@@ -45,8 +45,11 @@ constexpr std::size_t MAX_FRAME_BYTES = 64 * 1024;
 constexpr std::size_t MAX_QUEUE_BLOCKS = 512;
 constexpr uint32_t UDP_VERSION = 1;
 constexpr unsigned ADC_CLOCK_HZ = 80'000'000;
-constexpr unsigned ADC_DECIMATION_MAX = 10;
 constexpr unsigned STREAM_SELECTION_MAX = 1'000'000;
+constexpr uint32_t S31_ADC_SOURCE_MUX_MASK = 0x0000000fu;
+constexpr uint32_t S31_ADC_SOURCE_HW_DECIM_MASK = 0x00f00000u;
+constexpr unsigned S31_ADC_SOURCE_HW_DECIM_SHIFT = 20;
+constexpr uint32_t S31_STAGED_SOURCE_FLAGS = 0x49080000u;
 
 // USB transport: vendor interface on the ESP32-S31 native high-speed port.
 constexpr uint16_t USB_VID = 0x303A;
@@ -612,15 +615,23 @@ public:
     void setSampleRate(const int direction, const std::size_t channel, const double rate) override
     {
         checkRx(direction, channel);
-        const unsigned decimation = rateToDecimation(rate);
+        const unsigned field = rateToHardwareField(rate);
+        const uint32_t current = configUInt("iq_engine", "adc_source_sel", 3);
         Json::Value patch;
-        patch["iq_engine"]["adc_decimation"] = decimation;
+        patch["iq_engine"]["adc_decimation"] = 1;
+        patch["iq_engine"]["adc_source_sel"] =
+            S31_STAGED_SOURCE_FLAGS |
+            (uint32_t(field) << S31_ADC_SOURCE_HW_DECIM_SHIFT) |
+            (current & S31_ADC_SOURCE_MUX_MASK);
         applyPatch(patch);
     }
     double getSampleRate(const int direction, const std::size_t channel) const override
     {
         checkRx(direction, channel);
-        return 80e6 / configUInt("iq_engine", "adc_decimation", 10);
+        const uint32_t source = configUInt("iq_engine", "adc_source_sel", 3);
+        const unsigned field = (source & S31_ADC_SOURCE_HW_DECIM_MASK) >> S31_ADC_SOURCE_HW_DECIM_SHIFT;
+        const double rate = hardwareFieldRate(field);
+        return rate != 0.0 ? rate : 80e6 / configUInt("iq_engine", "adc_decimation", 10);
     }
     std::vector<double> listSampleRates(const int direction, const std::size_t channel) const override
     {
@@ -762,7 +773,9 @@ public:
         } else if (key == "adc_source_sel") {
             Json::Value patch;
             const unsigned source = parseUnsigned(value, "adc_source_sel", 0, 15);
-            patch["iq_engine"]["adc_source_sel"] = 0x08080000u | source;
+            const uint32_t current = configUInt("iq_engine", "adc_source_sel", 3);
+            patch["iq_engine"]["adc_source_sel"] =
+                (current & ~S31_ADC_SOURCE_MUX_MASK) | source;
             applyPatch(patch);
             return;
         } else if (key == "diag_loopback") {
@@ -1075,20 +1088,28 @@ private:
     {
         if (direction != SOAPY_SDR_RX || channel != 0) throw std::runtime_error("SoapyESPSDR supports RX channel 0 only");
     }
-    static unsigned rateToDecimation(double rate)
+    static double hardwareFieldRate(unsigned field)
     {
-        for (unsigned decimation = 1; decimation <= ADC_DECIMATION_MAX; ++decimation) {
-            if (std::abs(rate - double(ADC_CLOCK_HZ) / decimation) < 1) return decimation;
+        switch (field) {
+        case 7: return double(ADC_CLOCK_HZ) / 10.0;
+        case 8: return double(ADC_CLOCK_HZ) / 12.0;
+        case 9: return double(ADC_CLOCK_HZ) / 20.0;
+        case 10: return double(ADC_CLOCK_HZ) / 24.0;
+        default: return 0.0;
         }
-        throw std::runtime_error("sample rate must be 80 MSa/s divided by an integer from 1 to 10");
+    }
+    static unsigned rateToHardwareField(double rate)
+    {
+        for (const unsigned field : {7u, 8u, 9u, 10u}) {
+            if (std::abs(rate - hardwareFieldRate(field)) < 1) return field;
+        }
+        throw std::runtime_error(
+            "sample rate must be one of 3.333333, 4, 6.666667, or 8 MSa/s");
     }
     static std::vector<double> supportedSampleRates()
     {
-        std::vector<double> rates;
-        for (unsigned decimation = ADC_DECIMATION_MAX; decimation != 0; --decimation) {
-            rates.push_back(double(ADC_CLOCK_HZ) / decimation);
-        }
-        return rates;
+        return {hardwareFieldRate(10), hardwareFieldRate(9),
+                hardwareFieldRate(8), hardwareFieldRate(7)};
     }
     void applyDutyCycle(unsigned total, unsigned streamed)
     {

@@ -44,7 +44,8 @@ int main(int argc, char **argv)
         if (device->readSetting("cycle_total") != "5" ||
             device->readSetting("cycle_stream") != "2") throw std::runtime_error("duty-cycle readback mismatch");
         const std::vector<double> rates = device->listSampleRates(SOAPY_SDR_RX, 0);
-        if (rates.empty() || rates.front() != 8e6 || rates.back() != 80e6) throw std::runtime_error("sample-rate list mismatch");
+        if (rates.size() != 4 || std::abs(rates.front() - 80e6 / 24.0) > 1 ||
+            rates.back() != 8e6) throw std::runtime_error("sample-rate list mismatch");
         std::cout << "frequency, correction, analog bandwidth, gain, duty cycle, and sample rates: OK\n";
     } catch (const std::exception &error) {
         std::cerr << error.what() << '\n';

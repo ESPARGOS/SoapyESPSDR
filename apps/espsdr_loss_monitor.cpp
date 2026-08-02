@@ -6,6 +6,7 @@
 #include <chrono>
 #include <csignal>
 #include <cstdint>
+#include <cmath>
 #include <cstdlib>
 #include <iomanip>
 #include <iostream>
@@ -25,7 +26,7 @@ void stopHandler(int)
 
 struct Options {
     std::string host = "esp-sdr.local";
-    double rate = 8e6;
+    double rate = 4e6;
     double seconds = 10.0;
     double interval = 1.0;
     unsigned cycleTotal = 1;
@@ -225,7 +226,8 @@ int main(int argc, char **argv)
         device->deactivateStream(stream);
         device->closeStream(stream);
         stream = nullptr;
-        if (oldRate == 8e6 || oldRate == 16e6 || oldRate == 20e6) {
+        if (std::abs(oldRate - 80e6 / 24.0) < 1 || oldRate == 4e6 ||
+            std::abs(oldRate - 80e6 / 12.0) < 1 || oldRate == 8e6) {
             device->setSampleRate(SOAPY_SDR_RX, 0, oldRate);
         }
         SoapySDR::Device::unmake(device);
