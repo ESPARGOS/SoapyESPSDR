@@ -39,10 +39,13 @@ constexpr std::size_t IQ_HEADER_BYTES = 52;
 constexpr std::size_t IQ_SAMPLES = 1024;
 constexpr std::size_t IQ_FRAME_BYTES = IQ_HEADER_BYTES + IQ_SAMPLES * 4 + 4;
 // Compressed IQC8 frame: same header, interleaved int8 I/Q pairs (top 8 of
-// 10 sample bits), zero CRC field. USB transport only.
+// 10 sample bits), zero CRC field. Ethernet uses this to stay below the link
+// ceiling; USB may return full IQC1 and convert to the requested host format.
 constexpr std::size_t IQ8_FRAME_BYTES = IQ_HEADER_BYTES + IQ_SAMPLES * 2 + 4;
 constexpr std::size_t MAX_FRAME_BYTES = 64 * 1024;
-constexpr std::size_t MAX_QUEUE_BLOCKS = 512;
+// Absorb host-side scheduling stalls without discarding RF frames. At 4 MS/s
+// this provides about one second of elasticity while remaining modest in RAM.
+constexpr std::size_t MAX_QUEUE_BLOCKS = 4096;
 constexpr uint32_t UDP_VERSION = 1;
 constexpr unsigned ADC_CLOCK_HZ = 80'000'000;
 constexpr unsigned STREAM_SELECTION_MAX = 1'000'000;
@@ -966,7 +969,10 @@ public:
                                                           : &EspDevice::receiveLoop, state);
         Json::Value body;
         body["port"] = state->port;
-        body["stream_format"] = state->format == SOAPY_SDR_CS8 ? 1 : 0;
+        // Ethernet cannot carry full 4 MS/s IQC1 (~132 Mbit/s); request IQC8
+        // regardless of the application's buffer type and expand on the host.
+        // Native high-speed USB retains the higher-precision IQC1 wire path.
+        body["stream_format"] = state->usb == nullptr ? 1 : 0;
         try {
             _control->post("/api/v1/stream/start", body);
         } catch (...) {
