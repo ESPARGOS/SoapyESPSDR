@@ -77,11 +77,11 @@ Select a specific board with `usb_serial=<serial>` (the serial is the base
 MAC address, shown by `--find`). The firmware is built for either USB or
 Ethernet transport, and only one sample stream runs at a time.
 
-The `CS8` application format (USB only) returns the top 8 of each 10 sample
-bits. USB normally carries full-precision IQC1 frames and converts them to the
-format requested by the application. The production receiver has a fixed
-2 MSa/s complex rate. Raw USB device access without root requires a udev rule
-for VID `303a`, for example:
+Current firmware carries 4 MSa/s signed real `IQR8` frames over USB. The host
+performs the Fs/4 analytic conversion and exposes a fixed 2 MSa/s complex
+stream in `CS16`, `CF32`, or `CS8`. Moving this filter off the MCU keeps PARLIO
+acquisition continuous through USB endpoint jitter. Raw USB device access
+without root requires a udev rule for VID `303a`, for example:
 
 ```text
 SUBSYSTEM=="usb", ATTRS{idVendor}=="303a", MODE="0664", GROUP="plugdev", TAG+="uaccess"
@@ -128,8 +128,8 @@ The corresponding USB string is:
 soapy=0,driver=espsdr,usb_serial=30eda0f3f840,frequency_correction_ppm=8.272
 ```
 
-Select 2 MSa/s in Gqrx. If the module is not installed system-wide, launch Gqrx
-with:
+Select 16 MSa/s for Ethernet or 2 MSa/s for USB in Gqrx. If the module is not
+installed system-wide, launch Gqrx with:
 
 ```sh
 SOAPY_SDR_PLUGIN_PATH=/home/florian/prgm/esp32/SoapyESPSDR/build gqrx
@@ -140,9 +140,9 @@ SOAPY_SDR_PLUGIN_PATH=/home/florian/prgm/esp32/SoapyESPSDR/build gqrx
 - `CS16` native I/Q samples and `CF32` converted samples
 - Center frequencies from 2300 to 2800 MHz, with 1 kHz tuning resolution
 - Signed frontend frequency correction from -100 to +100 ppm
-- Fixed 2 MSa/s complex sample rate
+- Fixed 16 MSa/s complex rate over Ethernet or 2 MSa/s over USB
 - Automatic or manual receive gain
-- Manual receive gain from 0 to 76 dB in 1 dB steps
+- Manual receive gain from 0 to 69 dB in 1 dB steps on the tested board
 - Open/widest or 13–54 MHz analog receive-filter bandwidth
 
 Manual gain selects the ESP32-S31 PHY's calibrated receive-gain table. The
@@ -175,7 +175,7 @@ continuously receives samples and reports loss once per configured interval:
 export SOAPY_SDR_PLUGIN_PATH="$PWD/build"
 ./build/espsdr_loss_monitor \
     --host esp-sdr.local \
-    --rate 2000000 \
+    --rate 16000000 \
     --cycle-total 1 \
     --cycle-stream 1 \
     --seconds 30 \
@@ -183,7 +183,7 @@ export SOAPY_SDR_PLUGIN_PATH="$PWD/build"
 ```
 
 For the connected USB board, replace `--host esp-sdr.local` with
-`--device usb_serial=30eda0f3f840`.
+`--device usb_serial=30eda0f3f840` and use `--rate 2000000`.
 
 The output includes:
 
@@ -195,9 +195,10 @@ The output includes:
 - host receive-queue drops;
 - received UDP datagrams per second.
 
-Each I/Q frame contains 1,024 complex samples. Loss percentages are calculated
-from the firmware source-frame sequence. Expected discontinuities caused by
-changing radio settings are excluded from the loss counters.
+Current `IQR8` frames contain 4,096 real samples and produce 2,048 complex
+samples after host conversion. Loss percentages are calculated from the
+firmware source-frame sequence. Expected discontinuities caused by changing
+radio settings are excluded from the loss counters.
 
 ## Device arguments
 
@@ -222,4 +223,5 @@ The SoapySDR device string accepts these arguments:
 - One streaming client at a time.
 - No hardware timestamps or timed streaming.
 - Absolute gain and sensitivity can vary between boards and with frequency.
-- The production receiver currently exposes only 2 MSa/s complex IQ.
+- Sample rates are transport-specific: 16 MSa/s complex on Ethernet and
+  2 MSa/s complex on USB.

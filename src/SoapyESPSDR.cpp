@@ -21,6 +21,7 @@
 #include <chrono>
 #include <cmath>
 #include <condition_variable>
+#include <complex>
 #include <cstdint>
 #include <cstring>
 #include <deque>
@@ -42,13 +43,25 @@ constexpr std::size_t IQ_FRAME_BYTES = IQ_HEADER_BYTES + IQ_SAMPLES * 4 + 4;
 // 10 sample bits), zero CRC field. Ethernet uses this to stay below the link
 // ceiling; USB may return full IQC1 and convert to the requested host format.
 constexpr std::size_t IQ8_FRAME_BYTES = IQ_HEADER_BYTES + IQ_SAMPLES * 2 + 4;
+constexpr std::size_t REAL8_SAMPLES = IQ_SAMPLES * 4;
+constexpr std::size_t REAL8_FRAME_BYTES = IQ_HEADER_BYTES + REAL8_SAMPLES + 4;
+constexpr std::size_t MAX_BLOCK_SAMPLES = REAL8_SAMPLES / 2;
+constexpr double ETHERNET_SAMPLE_RATE = 16e6;
 constexpr std::size_t MAX_FRAME_BYTES = 64 * 1024;
-// Absorb host-side scheduling stalls without discarding RF frames. At 2 MS/s
-// this provides about two seconds of elasticity while remaining modest in RAM.
+// Absorb host-side scheduling stalls without discarding RF frames. At 16 MS/s
+// this provides about 260 ms of elasticity.
 constexpr std::size_t MAX_QUEUE_BLOCKS = 4096;
 constexpr uint32_t UDP_VERSION = 1;
 constexpr unsigned STREAM_SELECTION_MAX = 1'000'000;
 constexpr uint32_t S31_ADC_SOURCE_MUX_MASK = 0x0000000fu;
+constexpr std::size_t REAL_TIMING_TAPS = 25;
+// Ignore the first 8 ms after arming (modem AGC/startup transient), then use
+// the following 32 ms for the one-time interleaver calibration.  Every raw
+// frame remains buffered and is released in order after calibration.
+constexpr std::size_t REAL_TIMING_WARMUP_FRAMES = 64;
+constexpr std::size_t REAL_TIMING_MEASURE_FRAMES = 256;
+constexpr std::size_t REAL_TIMING_CALIBRATION_FRAMES =
+    REAL_TIMING_WARMUP_FRAMES + REAL_TIMING_MEASURE_FRAMES;
 
 // USB transport: vendor interface on the ESP32-S31 native high-speed port.
 constexpr uint16_t USB_VID = 0x303A;
@@ -412,9 +425,45 @@ struct PendingFrame {
 };
 
 struct SampleBlock {
-    std::array<int16_t, IQ_SAMPLES * 2> iq{};
+    std::array<int16_t, MAX_BLOCK_SAMPLES * 2> iq{};
     std::size_t offset = 0;
+    std::size_t samples = IQ_SAMPLES;
 };
+
+// 95-tap equiripple half-band filter: 7.2 MHz passband, 8.8 MHz stopband at
+// 32 MS/s, 0.0015 dB ripple and >81 dB image rejection. Every other tap is
+// zero, and symmetry reduces each 16 MS/s complex output to 24 real MACs.
+constexpr std::array<float, 24> REAL_HALF_BAND = {{
+    -8.92005200703e-05f, 0.00013469961315f,
+    -0.000231858370999f, 0.000372127242862f,
+    -0.000565968039619f, 0.000827792766952f,
+    -0.0011717411679f, 0.00161621326943f,
+    -0.00217988907681f, 0.00288658089657f,
+    -0.00376181252064f, 0.00483850628388f,
+    -0.00615511356419f, 0.00776369912039f,
+    -0.00973238651044f, 0.0121608180731f,
+    -0.0151968527782f, 0.0190806965405f,
+    -0.0242249383936f, 0.0314146099535f,
+    -0.042335421175f, 0.0613869749566f,
+    -0.104724206642f, 0.317848019165f,
+}};
+
+// Periodically time-varying fractional-delay correction for the PARLIO
+// diagnostic byte's two sampling phases. Pluto calibration measured the phase
+// separation as 0.2125 full-rate samples. The opposite-phase FIR is this array
+// reversed; which one applies to even samples depends on the arbitrary PARLIO
+// stream start phase and is detected from the first eight frames.
+constexpr std::array<float, REAL_TIMING_TAPS> REAL_TIMING_PHASE = {{
+    0.00210546176977f, -0.00395768309485f, 0.00478342085786f,
+    -0.00685873155397f, 0.00828749370302f, -0.0113467772303f,
+    0.0137575109676f, -0.0190021359772f, 0.0237643068762f,
+    -0.0358857837326f, 0.0506556060547f, -0.122746636936f,
+    1.03992338111f, 0.0994251540500f, -0.0573636365137f,
+    0.0336953104240f, -0.0260232555258f, 0.0184589876296f,
+    -0.0151582839739f, 0.0112245943668f, -0.00936390453089f,
+    0.00686844744574f, -0.00573979308791f, 0.00396546177867f,
+    -0.00346851487415f,
+}};
 
 struct StreamState {
     std::string format;
@@ -449,6 +498,19 @@ struct StreamState {
     std::atomic<int64_t> suppressContinuityUntilNs{0};
     std::atomic<unsigned> cycleTotal{1};
     std::atomic<unsigned> cycleStream{1};
+    std::array<float, 190> realHistory{};
+    std::array<float, 190> imagHistory{};
+    std::size_t historyPosition = 94;
+    unsigned mixerPhase = 2;
+    std::array<float, REAL_TIMING_TAPS * 2> timingHistory{};
+    std::size_t timingHistoryPosition = REAL_TIMING_TAPS - 1;
+    std::atomic<int> timingSkewSign{0};
+    std::array<float, 2> timingOffset{};
+    float timingCoefficientScale = 1.0f;
+    float timingOddGain = 1.0f;
+    std::atomic<int> timingSkewPpm{0};
+    std::atomic<int> timingOddGainPpm{1'000'000};
+    std::vector<std::array<int8_t, REAL8_SAMPLES>> timingCalibration;
 };
 
 class EspDevice final : public SoapySDR::Device {
@@ -614,27 +676,32 @@ public:
     void setSampleRate(const int direction, const std::size_t channel, const double rate) override
     {
         checkRx(direction, channel);
-        if (std::abs(rate - 2e6) >= 1)
-            throw std::runtime_error("sample rate must be 2 MSa/s");
+        const double supported = _usb == nullptr ? ETHERNET_SAMPLE_RATE : 2e6;
+        if (std::abs(rate - supported) >= 1)
+            throw std::runtime_error("sample rate must be " +
+                                     std::to_string(supported / 1e6) +
+                                     " MSa/s for this transport");
         Json::Value patch;
-        patch["iq_engine"]["adc_decimation"] = 2;
+        patch["iq_engine"]["adc_decimation"] = _usb == nullptr ? 1 : 2;
+        patch["rx_filter"]["rx_filter_override"] = _usb == nullptr ? 62 : 0;
         applyPatch(patch);
     }
     double getSampleRate(const int direction, const std::size_t channel) const override
     {
         checkRx(direction, channel);
-        return 2e6;
+        return _usb == nullptr ? ETHERNET_SAMPLE_RATE : 2e6;
     }
     std::vector<double> listSampleRates(const int direction, const std::size_t channel) const override
     {
         checkRx(direction, channel);
-        return {2e6};
+        return {getSampleRate(direction, channel)};
     }
     SoapySDR::RangeList getSampleRateRange(const int direction, const std::size_t channel) const override
     {
         checkRx(direction, channel);
         SoapySDR::RangeList ranges;
-        ranges.emplace_back(2e6, 2e6);
+        const double rate = getSampleRate(direction, channel);
+        ranges.emplace_back(rate, rate);
         return ranges;
     }
 
@@ -666,9 +733,9 @@ public:
         filterOverride.key = "rx_filter_override";
         filterOverride.value = "0";
         filterOverride.name = "Expert RX filter override";
-        filterOverride.description = "0=calibrated, 1=raw Wi-Fi, 2..35=BT probes, 36/37=Wi-Fi byte-pair probes";
+        filterOverride.description = "0=calibrated complex path; 62=32 MS/s real PARLIO plus host analytic conversion";
         filterOverride.type = SoapySDR::ArgInfo::INT;
-        filterOverride.range = SoapySDR::Range(0, 37, 1);
+        filterOverride.range = SoapySDR::Range(0, 62, 1);
 
         SoapySDR::ArgInfo filterMode;
         filterMode.key = "rx_filter_mode";
@@ -749,7 +816,7 @@ public:
             return;
         } else if (key == "rx_filter_override") {
             Json::Value patch;
-            patch["rx_filter"]["rx_filter_override"] = parseUnsigned(value, "rx_filter_override", 0, 37);
+            patch["rx_filter"]["rx_filter_override"] = parseUnsigned(value, "rx_filter_override", 0, 62);
             applyPatch(patch);
             return;
         } else if (key == "rx_filter_mode") {
@@ -837,7 +904,7 @@ public:
         patch["bandwidth"]["bw_mhz"] = 20;
         patch["bandwidth"]["second_chan"] = 0;
         patch["rx_filter"]["filter_bw_mhz"] = mhz;
-        patch["rx_filter"]["rx_filter_override"] = 0;
+        patch["rx_filter"]["rx_filter_override"] = _usb == nullptr ? 62 : 0;
         applyPatch(patch);
     }
     double getBandwidth(const int direction, const std::size_t channel) const override
@@ -861,8 +928,7 @@ public:
     std::vector<std::string> getStreamFormats(const int direction, const std::size_t channel) const override
     {
         checkRx(direction, channel);
-        if (_usb != nullptr) return {SOAPY_SDR_CS16, SOAPY_SDR_CF32, SOAPY_SDR_CS8};
-        return {SOAPY_SDR_CS16, SOAPY_SDR_CF32};
+        return {SOAPY_SDR_CS16, SOAPY_SDR_CF32, SOAPY_SDR_CS8};
     }
     std::string getNativeStreamFormat(const int direction, const std::size_t channel, double &fullScale) const override
     {
@@ -876,10 +942,9 @@ public:
     {
         checkRx(direction, channels.empty() ? 0 : channels.front());
         if (channels.size() > 1) throw std::runtime_error("SoapyESPSDR has one RX channel");
-        if (format == SOAPY_SDR_CS8) {
-            if (_usb == nullptr) throw std::runtime_error("CS8 (compressed int8 wire format) requires the USB transport");
-        } else if (format != SOAPY_SDR_CS16 && format != SOAPY_SDR_CF32) {
-            throw std::runtime_error("supported formats are CS16, CF32, and CS8 (USB only)");
+        if (format != SOAPY_SDR_CS8 && format != SOAPY_SDR_CS16 &&
+            format != SOAPY_SDR_CF32) {
+            throw std::runtime_error("supported formats are CS16, CF32, and CS8");
         }
         if (_stream != nullptr) throw std::runtime_error("only one RX stream is supported");
         auto state = std::make_unique<StreamState>();
@@ -924,8 +989,11 @@ public:
     }
     std::size_t getStreamMTU(SoapySDR::Stream *stream) const override
     {
-        checkedStream(stream);
-        return IQ_SAMPLES;
+        (void)checkedStream(stream);
+        /* IQR8 carries 4096 real samples and produces 2048 complex samples
+         * on both transports. Advertising that full host-DSP block also
+         * remains valid when talking to older IQC1 USB firmware. */
+        return MAX_BLOCK_SAMPLES;
     }
     int activateStream(SoapySDR::Stream *stream, const int flags, const long long, const std::size_t numElems) override
     {
@@ -936,6 +1004,8 @@ public:
         patch["stream"]["output_mode"] = 0;
         patch["stream"]["stream_wifi_packets"] = 0;
         patch["trigger"]["trigger_mode"] = 0;
+        patch["iq_engine"]["adc_decimation"] = state->usb == nullptr ? 1 : 2;
+        patch["rx_filter"]["rx_filter_override"] = state->usb == nullptr ? 62 : 0;
         const unsigned total = _cycleTotal.load();
         const unsigned streamed = _cycleStream.load();
         patch["trigger"]["trigger_config"] = intervalTrigger(total, streamed);
@@ -951,6 +1021,7 @@ public:
             state->haveExpectedSource = false;
             state->haveFirmwareDropped = false;
             state->haveMinimumFrameSequence = false;
+            resetRealDsp(state);
         }
         state->stop = false;
         state->active = true;
@@ -958,9 +1029,8 @@ public:
                                                           : &EspDevice::receiveLoop, state);
         Json::Value body;
         body["port"] = state->port;
-        // Ethernet requests compact IQC8 regardless of the application's
-        // buffer type and expands it on the host. Native high-speed USB
-        // retains the higher-precision IQC1 wire path.
+        // Current Ethernet and USB firmware emit IQR8; the requested value
+        // remains compatible with older USB firmware that emitted IQC1.
         body["stream_format"] = state->usb == nullptr ? 1 : 0;
         try {
             _control->post("/api/v1/stream/start", body);
@@ -1006,7 +1076,8 @@ public:
         std::size_t produced = 0;
         while (produced < numElems && !state->queue.empty()) {
             SampleBlock &block = state->queue.front();
-            const std::size_t count = std::min(numElems - produced, IQ_SAMPLES - block.offset);
+            const std::size_t count = std::min(numElems - produced,
+                                               block.samples - block.offset);
             if (state->format == SOAPY_SDR_CS16) {
                 auto *output = static_cast<int16_t *>(buffers[0]);
                 std::memcpy(output + produced * 2, block.iq.data() + block.offset * 2, count * 2 * sizeof(int16_t));
@@ -1019,7 +1090,7 @@ public:
             }
             produced += count;
             block.offset += count;
-            if (block.offset == IQ_SAMPLES) state->queue.pop_front();
+            if (block.offset == block.samples) state->queue.pop_front();
         }
         return static_cast<int>(produced);
     }
@@ -1028,6 +1099,7 @@ public:
     {
         return {"datagrams", "invalid_datagrams", "completed_frames", "lost_chunks",
                 "firmware_drops", "queue_drops", "capture_restarts",
+                "timing_skew_sign", "timing_skew_ppm", "timing_odd_gain_ppm",
                 "adc_dump_cfg", "adc_dump_mode"};
     }
     SoapySDR::ArgInfo getSensorInfo(const std::string &key) const override
@@ -1049,6 +1121,9 @@ public:
         if (key == "firmware_drops") return std::to_string(state->firmwareDrops.load());
         if (key == "queue_drops") return std::to_string(state->queueDrops.load());
         if (key == "capture_restarts") return std::to_string(state->captureRestarts.load());
+        if (key == "timing_skew_sign") return std::to_string(state->timingSkewSign.load());
+        if (key == "timing_skew_ppm") return std::to_string(state->timingSkewPpm.load());
+        if (key == "timing_odd_gain_ppm") return std::to_string(state->timingOddGainPpm.load());
         if (key == "adc_dump_cfg" || key == "adc_dump_mode") {
             const Json::Value status = _control->get("/api/v1/status");
             return std::to_string(status[key].asUInt());
@@ -1177,11 +1252,383 @@ private:
         if (frame.size() < 4 || le32(frame.data() + frame.size() - 4) != pending.first.frameCrc) return false;
         return static_cast<uint32_t>(crc32(0, frame.data(), frame.size() - 4)) == pending.first.frameCrc;
     }
+    static void resetRealDsp(StreamState *state)
+    {
+        state->realHistory.fill(0.0f);
+        state->imagHistory.fill(0.0f);
+        state->historyPosition = 94;
+        // Keep the fractional-delay FIR's causalized group delay in the Fs/4
+        // mixer phase. This preserves one output for every input pair without
+        // a frequency or conjugation error.
+        state->mixerPhase =
+            (4u - unsigned((REAL_TIMING_TAPS / 2) & 3u)) & 3u;
+        state->timingHistory.fill(0.0f);
+        state->timingHistoryPosition = REAL_TIMING_TAPS - 1;
+        state->timingSkewSign = 0;
+        state->timingOffset.fill(0.0f);
+        /* The 4 MHz USB capture clock is synchronous with the ADC update
+         * cadence and needs no alternating fractional-delay correction. The
+         * 32 MHz Ethernet clock crosses the 80 MHz ADC cadence and retains
+         * the measured conservative correction until calibration refines it. */
+        state->timingCoefficientScale = state->usb != nullptr ? 0.0f : 1.0f;
+        state->timingOddGain = 1.0f;
+        state->timingSkewPpm = 0;
+        state->timingOddGainPpm = 1'000'000;
+        state->timingCalibration.clear();
+        state->timingCalibration.reserve(REAL_TIMING_CALIBRATION_FRAMES);
+    }
+    static void calibrationFft(std::vector<std::complex<float>> &data)
+    {
+        const std::size_t size = data.size();
+        for (std::size_t i = 1, j = 0; i < size; ++i) {
+            std::size_t bit = size >> 1;
+            for (; j & bit; bit >>= 1) j ^= bit;
+            j ^= bit;
+            if (i < j) std::swap(data[i], data[j]);
+        }
+        for (std::size_t length = 2; length <= size; length <<= 1) {
+            const float angle = -2.0f * float(M_PI) / float(length);
+            const std::complex<float> step(std::cos(angle), std::sin(angle));
+            for (std::size_t start = 0; start < size; start += length) {
+                std::complex<float> rotation(1.0f, 0.0f);
+                for (std::size_t offset = 0; offset < length / 2; ++offset) {
+                    const auto even = data[start + offset];
+                    const auto odd = data[start + offset + length / 2] * rotation;
+                    data[start + offset] = even + odd;
+                    data[start + offset + length / 2] = even - odd;
+                    rotation *= step;
+                }
+            }
+        }
+    }
+    static int detectTimingSkew(StreamState *state)
+    {
+        double evenMean = 0.0;
+        double oddMean = 0.0;
+        std::size_t pairs = 0;
+        for (std::size_t frameIndex = REAL_TIMING_WARMUP_FRAMES;
+             frameIndex < state->timingCalibration.size(); ++frameIndex) {
+            const auto &frame = state->timingCalibration[frameIndex];
+            for (std::size_t i = 0; i < REAL8_SAMPLES; i += 2) {
+                evenMean += frame[i];
+                oddMean += frame[i + 1];
+                ++pairs;
+            }
+        }
+        if (pairs == 0) return 1;
+        evenMean /= pairs;
+        oddMean /= pairs;
+        state->timingOffset[0] = static_cast<float>(evenMean);
+        state->timingOffset[1] = static_cast<float>(oddMean);
+        double metric = 0.0;
+        std::size_t pairIndex = 0;
+        for (std::size_t frameIndex = REAL_TIMING_WARMUP_FRAMES;
+             frameIndex < state->timingCalibration.size(); ++frameIndex) {
+            const auto &frame = state->timingCalibration[frameIndex];
+            for (std::size_t i = 0; i < REAL8_SAMPLES; i += 2, ++pairIndex) {
+                if (pairIndex + 1 >= pairs) break;
+                const double even = frame[i] - evenMean;
+                const double odd = frame[i + 1] - oddMean;
+                double nextEven;
+                if (i + 2 < REAL8_SAMPLES) {
+                    nextEven = frame[i + 2] - evenMean;
+                } else {
+                    if (frameIndex + 1 < state->timingCalibration.size()) {
+                        nextEven =
+                            state->timingCalibration[frameIndex + 1][0] -
+                            evenMean;
+                    } else {
+                        break;
+                    }
+                }
+                metric += odd * nextEven - even * odd;
+            }
+        }
+        int sign = metric >= 0.0 ? 1 : -1;
+        state->timingSkewPpm = static_cast<int>(std::lround(
+            sign * state->timingCoefficientScale * 212500.0f));
+
+        // A dominant RF line lets us minimize the actual Fs/2-f image.  Do
+        // not estimate the mismatch from the two decimated phase streams:
+        // each is only 16 MS/s, so a line above 8 MHz aliases onto its own
+        // conjugate and biases that estimate.  Instead, measure the desired
+        // and image phasors in the full-rate spectrum and evaluate the exact
+        // two-periodic FIR response over a small (skew, gain) grid.
+        std::vector<std::complex<float>> spectrum;
+        spectrum.reserve(pairs * 2);
+        std::size_t sampleIndex = 0;
+        const std::size_t calibrationSamples = pairs * 2;
+        for (std::size_t frameIndex = REAL_TIMING_WARMUP_FRAMES;
+             frameIndex < state->timingCalibration.size(); ++frameIndex) {
+            const auto &frame = state->timingCalibration[frameIndex];
+            for (std::size_t i = 0; i < REAL8_SAMPLES; ++i) {
+                const double mean = (i & 1u) ? oddMean : evenMean;
+                const float window = 0.5f - 0.5f * std::cos(
+                    2.0f * float(M_PI) * float(sampleIndex) /
+                    float(calibrationSamples - 1));
+                spectrum.emplace_back(float(frame[i] - mean) * window, 0.0f);
+                ++sampleIndex;
+            }
+        }
+        calibrationFft(spectrum);
+        const std::size_t firstBin = spectrum.size() / 64;
+        const std::size_t lastBin = spectrum.size() / 2 - firstBin;
+        std::size_t peakBin = firstBin;
+        float peakPower = 0.0f;
+        std::vector<float> powers;
+        powers.reserve(lastBin - firstBin);
+        for (std::size_t bin = firstBin; bin < lastBin; ++bin) {
+            const float power = std::norm(spectrum[bin]);
+            powers.push_back(power);
+            if (power > peakPower) {
+                peakPower = power;
+                peakBin = bin;
+            }
+        }
+        if (!powers.empty()) {
+            auto middle = powers.begin() + powers.size() / 2;
+            std::nth_element(powers.begin(), middle, powers.end());
+            const float medianPower = std::max(*middle, 1e-20f);
+            std::size_t strongClusters = 0;
+            bool inStrongCluster = false;
+            for (std::size_t bin = firstBin; bin < lastBin; ++bin) {
+                const bool strong = std::norm(spectrum[bin]) >
+                                    peakPower / 15.8489f; // peak - 12 dB
+                if (strong && !inStrongCluster) ++strongClusters;
+                inStrongCluster = strong;
+            }
+            // Internal modem spurs can exceed 15 dB with no antenna signal;
+            // require a genuinely isolated calibration carrier before
+            // adapting away from the conservative fixed correction. The
+            // cluster-count check prevents an OFDM/multitone signal from
+            // being mistaken for a calibration tone and equalized at one bin.
+            if (peakPower > medianPower * 1000.0f && // 30 dB above floor
+                strongClusters <= 4) {
+                const std::size_t size = spectrum.size();
+                const double left = std::log(std::max(
+                    std::abs(spectrum[peakBin - 1]), 1e-20f));
+                const double center = std::log(std::max(
+                    std::abs(spectrum[peakBin]), 1e-20f));
+                const double right = std::log(std::max(
+                    std::abs(spectrum[peakBin + 1]), 1e-20f));
+                const double curvature = left - 2.0 * center + right;
+                const double fractionalBin = std::abs(curvature) > 1e-12
+                    ? std::clamp(0.5 * (left - right) / curvature, -0.5, 0.5)
+                    : 0.0;
+                const double omega = 2.0 * M_PI *
+                    (double(peakBin) + fractionalBin) / double(size);
+                const double imageOmega = M_PI - omega;
+
+                // Re-project at the interpolated frequency.  This avoids a
+                // 122 Hz FFT-bin quantization error; a few tens of hertz are
+                // enough to bias the very deep image null we are seeking.
+                std::complex<double> desired(0.0, 0.0);
+                std::complex<double> desiredPair(0.0, 0.0);
+                std::complex<double> image(0.0, 0.0);
+                std::complex<double> imagePair(0.0, 0.0);
+                std::complex<double> desiredRotation(1.0, 0.0);
+                std::complex<double> desiredPairRotation(1.0, 0.0);
+                std::complex<double> imageRotation(1.0, 0.0);
+                std::complex<double> imagePairRotation(1.0, 0.0);
+                const auto desiredStep = std::polar(1.0, -omega);
+                const auto desiredPairStep = std::polar(1.0, -(omega - M_PI));
+                const auto imageStep = std::polar(1.0, -imageOmega);
+                const auto imagePairStep = std::polar(
+                    1.0, -(imageOmega - M_PI));
+                sampleIndex = 0;
+                for (std::size_t frameIndex = REAL_TIMING_WARMUP_FRAMES;
+                     frameIndex < state->timingCalibration.size();
+                     ++frameIndex) {
+                    const auto &frame = state->timingCalibration[frameIndex];
+                    for (std::size_t i = 0; i < REAL8_SAMPLES; ++i) {
+                        const double mean = (i & 1u) ? oddMean : evenMean;
+                        const double window = 0.5 - 0.5 * std::cos(
+                            2.0 * M_PI * double(sampleIndex) /
+                            double(calibrationSamples - 1));
+                        const double value = (frame[i] - mean) * window;
+                        desired += value * desiredRotation;
+                        desiredPair += value * desiredPairRotation;
+                        image += value * imageRotation;
+                        imagePair += value * imagePairRotation;
+                        desiredRotation *= desiredStep;
+                        desiredPairRotation *= desiredPairStep;
+                        imageRotation *= imageStep;
+                        imagePairRotation *= imagePairStep;
+                        ++sampleIndex;
+                    }
+                }
+
+                auto coefficient = [](std::size_t tap, double scale) {
+                    double value = REAL_TIMING_PHASE[tap];
+                    if (tap == REAL_TIMING_TAPS / 2) {
+                        value = 1.0 + scale * (value - 1.0);
+                    } else {
+                        value *= scale;
+                    }
+                    return value;
+                };
+                auto response = [&](double frequency, bool forward,
+                                    double scale) {
+                    std::complex<double> value(0.0, 0.0);
+                    for (std::size_t tap = 0; tap < REAL_TIMING_TAPS; ++tap) {
+                        const std::size_t index = forward
+                            ? tap : REAL_TIMING_TAPS - 1 - tap;
+                        const int offset = int(tap) -
+                                           int(REAL_TIMING_TAPS / 2);
+                        value += coefficient(index, scale) *
+                                 std::polar(1.0, frequency * double(offset));
+                    }
+                    return value;
+                };
+                auto periodicComponents = [&](double frequency,
+                                              int candidateSign,
+                                              double scale) {
+                    const bool evenForward = candidateSign > 0;
+                    const auto even = response(frequency, evenForward, scale);
+                    const auto odd = response(frequency, !evenForward, scale);
+                    const auto directResponse = 0.5 * (even + odd);
+                    const double pairedFrequency = frequency - M_PI;
+                    const auto pairedEven = response(
+                        pairedFrequency, evenForward, scale);
+                    const auto pairedOdd = response(
+                        pairedFrequency, !evenForward, scale);
+                    const auto pairedResponse =
+                        0.5 * (pairedEven - pairedOdd);
+                    return std::make_pair(directResponse, pairedResponse);
+                };
+                auto periodicOutput = [](std::complex<double> direct,
+                                         std::complex<double> paired,
+                                         const auto &components,
+                                         double oddGain) {
+                    const double common = 0.5 * (1.0 + oddGain);
+                    const double alternating = 0.5 * (1.0 - oddGain);
+                    const auto gainedDirect =
+                        common * direct + alternating * paired;
+                    const auto gainedPair =
+                        common * paired + alternating * direct;
+                    return components.first * gainedDirect +
+                           components.second * gainedPair;
+                };
+
+                double bestRatio = 0.0;
+                int bestSign = sign;
+                double bestScale = 1.0;
+                double bestGain = sign > 0 ? 0.95 : 1.0 / 0.95;
+                for (int candidateSign : {-1, 1}) {
+                    for (int skewStep = 0; skewStep <= 560; ++skewStep) {
+                        const double scale = double(skewStep) / 400.0;
+                        const auto desiredComponents = periodicComponents(
+                            omega, candidateSign, scale);
+                        const auto imageComponents = periodicComponents(
+                            imageOmega, candidateSign, scale);
+                        for (int gainStep = 680; gainStep <= 920; ++gainStep) {
+                            const double gain = double(gainStep) / 800.0;
+                            const auto correctedDesired = periodicOutput(
+                                desired, desiredPair, desiredComponents, gain);
+                            const auto correctedImage = periodicOutput(
+                                image, imagePair, imageComponents, gain);
+                            const double ratio = std::norm(correctedDesired) /
+                                std::max(std::norm(correctedImage), 1e-30);
+                            if (ratio > bestRatio) {
+                                bestRatio = ratio;
+                                bestSign = candidateSign;
+                                bestScale = scale;
+                                bestGain = gain;
+                            }
+                        }
+                    }
+                }
+                sign = bestSign;
+                state->timingCoefficientScale = float(bestScale);
+                state->timingOddGain = float(bestGain);
+                state->timingSkewPpm = static_cast<int>(std::lround(
+                    bestSign * bestScale * 212500.0));
+                state->timingOddGainPpm = static_cast<int>(std::lround(
+                    bestGain * 1e6));
+            }
+        }
+        return sign;
+    }
+    static float correctRealSample(StreamState *state, float sample)
+    {
+        const bool targetEven = (state->mixerPhase & 1u) == 0u;
+        sample = (sample - state->timingOffset[targetEven ? 0u : 1u]) * 4.0f;
+        if (!targetEven) sample *= state->timingOddGain;
+        state->timingHistoryPosition =
+            (state->timingHistoryPosition + 1) % REAL_TIMING_TAPS;
+        const std::size_t pos = state->timingHistoryPosition;
+        state->timingHistory[pos] =
+            state->timingHistory[pos + REAL_TIMING_TAPS] = sample;
+        const float *current = state->timingHistory.data() +
+                               pos + REAL_TIMING_TAPS;
+        const bool forward =
+            targetEven == (state->timingSkewSign.load() > 0);
+        float corrected = 0.0f;
+        for (std::size_t tap = 0; tap < REAL_TIMING_TAPS; ++tap) {
+            const std::size_t coefficient =
+                forward ? tap : REAL_TIMING_TAPS - 1 - tap;
+            float value = REAL_TIMING_PHASE[coefficient];
+            if (coefficient == REAL_TIMING_TAPS / 2) {
+                value = 1.0f + state->timingCoefficientScale * (value - 1.0f);
+            } else {
+                value *= state->timingCoefficientScale;
+            }
+            corrected += value *
+                         current[-static_cast<std::ptrdiff_t>(
+                             REAL_TIMING_TAPS - 1 - tap)];
+        }
+        return corrected;
+    }
+    static void processRealFrame(StreamState *state, const uint8_t *samples,
+                                 SampleBlock &block)
+    {
+        block.samples = REAL8_SAMPLES / 2;
+        auto push = [state](float real, float imag) {
+            state->historyPosition = (state->historyPosition + 1) % 95;
+            const std::size_t pos = state->historyPosition;
+            state->realHistory[pos] = state->realHistory[pos + 95] = real;
+            state->imagHistory[pos] = state->imagHistory[pos + 95] = imag;
+        };
+        for (std::size_t output = 0; output < REAL8_SAMPLES / 2; ++output) {
+            float x = correctRealSample(
+                state, float(int8_t(samples[2 * output])));
+            // e^(-j*pi*n/2): 1, -j, -1, +j. Frame length is a
+            // multiple of four, so phase continuity follows frame continuity.
+            if (state->mixerPhase == 0) push(x, 0.0f);
+            else push(-x, 0.0f); // phase 2
+            state->mixerPhase = (state->mixerPhase + 1) & 3u;
+
+            const float *real = state->realHistory.data() +
+                                state->historyPosition + 95;
+            const float *imag = state->imagHistory.data() +
+                                state->historyPosition + 95;
+            float acc = 0.0f;
+            for (std::size_t tap = 0; tap < REAL_HALF_BAND.size(); ++tap) {
+                const std::size_t index = tap * 2;
+                acc += REAL_HALF_BAND[tap] *
+                       (real[-static_cast<std::ptrdiff_t>(index)] +
+                        real[-static_cast<std::ptrdiff_t>(94 - index)]);
+            }
+            const long i = std::lround(2.0f * acc);
+            const long q = std::lround(imag[-47]);
+            block.iq[2 * output] = static_cast<int16_t>(
+                std::clamp(i, -512l, 511l));
+            block.iq[2 * output + 1] = static_cast<int16_t>(
+                std::clamp(q, -512l, 511l));
+
+            x = correctRealSample(
+                state, float(int8_t(samples[2 * output + 1])));
+            if (state->mixerPhase == 1) push(0.0f, -x);
+            else push(0.0f, x); // phase 3
+            state->mixerPhase = (state->mixerPhase + 1) & 3u;
+        }
+    }
     static void finishFrame(StreamState *state, PendingFrame &&pending)
     {
         const bool full = pending.data.size() == IQ_FRAME_BYTES && std::memcmp(pending.data.data(), "IQC1", 4) == 0;
         const bool compressed = pending.data.size() == IQ8_FRAME_BYTES && std::memcmp(pending.data.data(), "IQC8", 4) == 0;
-        if (!validFrame(pending) || (!full && !compressed)) {
+        const bool real = pending.data.size() == REAL8_FRAME_BYTES && std::memcmp(pending.data.data(), "IQR8", 4) == 0;
+        if (!validFrame(pending) || (!full && !compressed && !real)) {
             state->invalidDatagrams++;
             return;
         }
@@ -1194,7 +1641,7 @@ private:
             for (std::size_t i = 0; i < IQ_SAMPLES * 2; ++i) {
                 block.iq[i] = int16_t(int8_t(sampleData[i])) * 4;
             }
-        } else {
+        } else if (full) {
             for (std::size_t i = 0; i < IQ_SAMPLES; ++i) {
                 const uint32_t word = le32(sampleData + i * 4);
                 // The dump word stores Q in bits 9:0 and I in bits 19:10;
@@ -1217,6 +1664,7 @@ private:
                 if (state->expectedSource - source <= std::max(8u, total * 2u)) return;
                 state->queue.clear();
                 state->captureRestarts++;
+                resetRealDsp(state);
                 if (!suppressContinuity) state->overflowPending = true;
             }
             if (source > state->expectedSource) {
@@ -1228,14 +1676,37 @@ private:
         }
         state->expectedSource = nextSelectedSource(source, total, streamed);
         state->haveExpectedSource = true;
-        if (state->queue.size() >= MAX_QUEUE_BLOCKS) {
-            state->queue.pop_front();
-            state->queueDrops++;
-            state->overflowPending = true;
+        auto enqueue = [state](SampleBlock &&ready) {
+            if (state->queue.size() >= MAX_QUEUE_BLOCKS) {
+                state->queue.pop_front();
+                state->queueDrops++;
+                state->overflowPending = true;
+            }
+            state->queue.emplace_back(std::move(ready));
+        };
+        if (real && state->timingSkewSign.load() == 0) {
+            std::array<int8_t, REAL8_SAMPLES> raw{};
+            std::memcpy(raw.data(), sampleData, raw.size());
+            state->timingCalibration.emplace_back(std::move(raw));
+            if (state->timingCalibration.size() ==
+                REAL_TIMING_CALIBRATION_FRAMES) {
+                state->timingSkewSign = detectTimingSkew(state);
+                for (const auto &calibration : state->timingCalibration) {
+                    SampleBlock corrected;
+                    processRealFrame(
+                        state,
+                        reinterpret_cast<const uint8_t *>(calibration.data()),
+                        corrected);
+                    enqueue(std::move(corrected));
+                }
+                state->timingCalibration.clear();
+            }
+        } else {
+            if (real) processRealFrame(state, sampleData, block);
+            enqueue(std::move(block));
         }
-        state->queue.emplace_back(std::move(block));
         state->completedFrames++;
-        state->condition.notify_one();
+        state->condition.notify_all();
     }
     static void handleDatagram(StreamState *state, const uint8_t *data, std::size_t bytes)
     {
@@ -1243,7 +1714,8 @@ private:
         UdpHeader header;
         if (!parseHeader(data, bytes, header)) { state->invalidDatagrams++; return; }
         if (std::memcmp(header.frameMagic.data(), "IQC1", 4) != 0 &&
-            std::memcmp(header.frameMagic.data(), "IQC8", 4) != 0) return;
+            std::memcmp(header.frameMagic.data(), "IQC8", 4) != 0 &&
+            std::memcmp(header.frameMagic.data(), "IQR8", 4) != 0) return;
         if (!state->haveEpoch || state->epoch != header.epoch) {
             std::lock_guard<std::mutex> lock(state->mutex);
             state->epoch = header.epoch;
@@ -1253,6 +1725,7 @@ private:
             state->haveExpectedSource = false;
             state->haveFirmwareDropped = false;
             state->haveMinimumFrameSequence = false;
+            resetRealDsp(state);
         }
         bool captureRestart = false;
         {
@@ -1263,6 +1736,7 @@ private:
                 state->queue.clear();
                 state->haveExpectedSource = false;
                 state->captureRestarts++;
+                resetRealDsp(state);
                 if (monotonicNanoseconds() >= state->suppressContinuityUntilNs.load()) {
                     state->overflowPending = true;
                 }
