@@ -26,7 +26,8 @@ void stopHandler(int)
 
 struct Options {
     std::string host = "esp-sdr.local";
-    double rate = 4e6;
+    std::string deviceArgs;
+    double rate = 2e6;
     double seconds = 10.0;
     double interval = 1.0;
     unsigned cycleTotal = 1;
@@ -36,7 +37,7 @@ struct Options {
 void usage(const char *program)
 {
     std::cerr << "Usage: " << program
-              << " [--host HOST] [--rate HZ] [--seconds N] [--interval N]"
+              << " [--host HOST | --device ARGS] [--rate HZ] [--seconds N] [--interval N]"
                  " [--cycle-total N] [--cycle-stream N]\n";
 }
 
@@ -52,6 +53,7 @@ Options parseOptions(int argc, char **argv)
         if (i + 1 >= argc) throw std::runtime_error("missing value after " + argument);
         const std::string value = argv[++i];
         if (argument == "--host") options.host = value;
+        else if (argument == "--device") options.deviceArgs = value;
         else if (argument == "--rate") options.rate = std::stod(value);
         else if (argument == "--seconds") options.seconds = std::stod(value);
         else if (argument == "--interval") options.interval = std::stod(value);
@@ -158,8 +160,10 @@ int main(int argc, char **argv)
     SoapySDR::Device *device = nullptr;
     SoapySDR::Stream *stream = nullptr;
     try {
+        const std::string selector = options.deviceArgs.empty()
+            ? "host=" + options.host : options.deviceArgs;
         device = SoapySDR::Device::make(
-            "driver=espsdr,host=" + options.host +
+            "driver=espsdr," + selector +
             ",cycle_total=" + std::to_string(options.cycleTotal) +
             ",cycle_stream=" + std::to_string(options.cycleStream));
         if (device == nullptr) throw std::runtime_error("failed to open SoapyESPSDR device");
@@ -226,8 +230,7 @@ int main(int argc, char **argv)
         device->deactivateStream(stream);
         device->closeStream(stream);
         stream = nullptr;
-        if (std::abs(oldRate - 80e6 / 24.0) < 1 || oldRate == 4e6 ||
-            std::abs(oldRate - 80e6 / 12.0) < 1 || oldRate == 8e6) {
+        if (std::abs(oldRate - 2e6) < 1) {
             device->setSampleRate(SOAPY_SDR_RX, 0, oldRate);
         }
         SoapySDR::Device::unmake(device);

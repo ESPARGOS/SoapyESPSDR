@@ -43,16 +43,12 @@ constexpr std::size_t IQ_FRAME_BYTES = IQ_HEADER_BYTES + IQ_SAMPLES * 4 + 4;
 // ceiling; USB may return full IQC1 and convert to the requested host format.
 constexpr std::size_t IQ8_FRAME_BYTES = IQ_HEADER_BYTES + IQ_SAMPLES * 2 + 4;
 constexpr std::size_t MAX_FRAME_BYTES = 64 * 1024;
-// Absorb host-side scheduling stalls without discarding RF frames. At 4 MS/s
-// this provides about one second of elasticity while remaining modest in RAM.
+// Absorb host-side scheduling stalls without discarding RF frames. At 2 MS/s
+// this provides about two seconds of elasticity while remaining modest in RAM.
 constexpr std::size_t MAX_QUEUE_BLOCKS = 4096;
 constexpr uint32_t UDP_VERSION = 1;
-constexpr unsigned ADC_CLOCK_HZ = 80'000'000;
 constexpr unsigned STREAM_SELECTION_MAX = 1'000'000;
 constexpr uint32_t S31_ADC_SOURCE_MUX_MASK = 0x0000000fu;
-constexpr uint32_t S31_ADC_SOURCE_HW_DECIM_MASK = 0x00f00000u;
-constexpr unsigned S31_ADC_SOURCE_HW_DECIM_SHIFT = 20;
-constexpr uint32_t S31_STAGED_SOURCE_FLAGS = 0x49080000u;
 
 // USB transport: vendor interface on the ESP32-S31 native high-speed port.
 constexpr uint16_t USB_VID = 0x303A;
@@ -618,34 +614,27 @@ public:
     void setSampleRate(const int direction, const std::size_t channel, const double rate) override
     {
         checkRx(direction, channel);
-        const unsigned field = rateToHardwareField(rate);
-        const uint32_t current = configUInt("iq_engine", "adc_source_sel", 3);
+        if (std::abs(rate - 2e6) >= 1)
+            throw std::runtime_error("sample rate must be 2 MSa/s");
         Json::Value patch;
-        patch["iq_engine"]["adc_decimation"] = 1;
-        patch["iq_engine"]["adc_source_sel"] =
-            S31_STAGED_SOURCE_FLAGS |
-            (uint32_t(field) << S31_ADC_SOURCE_HW_DECIM_SHIFT) |
-            (current & S31_ADC_SOURCE_MUX_MASK);
+        patch["iq_engine"]["adc_decimation"] = 2;
         applyPatch(patch);
     }
     double getSampleRate(const int direction, const std::size_t channel) const override
     {
         checkRx(direction, channel);
-        const uint32_t source = configUInt("iq_engine", "adc_source_sel", 3);
-        const unsigned field = (source & S31_ADC_SOURCE_HW_DECIM_MASK) >> S31_ADC_SOURCE_HW_DECIM_SHIFT;
-        const double rate = hardwareFieldRate(field);
-        return rate != 0.0 ? rate : 80e6 / configUInt("iq_engine", "adc_decimation", 10);
+        return 2e6;
     }
     std::vector<double> listSampleRates(const int direction, const std::size_t channel) const override
     {
         checkRx(direction, channel);
-        return supportedSampleRates();
+        return {2e6};
     }
     SoapySDR::RangeList getSampleRateRange(const int direction, const std::size_t channel) const override
     {
         checkRx(direction, channel);
         SoapySDR::RangeList ranges;
-        for (const double rate : supportedSampleRates()) ranges.emplace_back(rate, rate);
+        ranges.emplace_back(2e6, 2e6);
         return ranges;
     }
 
@@ -969,9 +958,9 @@ public:
                                                           : &EspDevice::receiveLoop, state);
         Json::Value body;
         body["port"] = state->port;
-        // Ethernet cannot carry full 4 MS/s IQC1 (~132 Mbit/s); request IQC8
-        // regardless of the application's buffer type and expand on the host.
-        // Native high-speed USB retains the higher-precision IQC1 wire path.
+        // Ethernet requests compact IQC8 regardless of the application's
+        // buffer type and expands it on the host. Native high-speed USB
+        // retains the higher-precision IQC1 wire path.
         body["stream_format"] = state->usb == nullptr ? 1 : 0;
         try {
             _control->post("/api/v1/stream/start", body);
@@ -1093,29 +1082,6 @@ private:
     static void checkRx(const int direction, const std::size_t channel)
     {
         if (direction != SOAPY_SDR_RX || channel != 0) throw std::runtime_error("SoapyESPSDR supports RX channel 0 only");
-    }
-    static double hardwareFieldRate(unsigned field)
-    {
-        switch (field) {
-        case 7: return double(ADC_CLOCK_HZ) / 10.0;
-        case 8: return double(ADC_CLOCK_HZ) / 12.0;
-        case 9: return double(ADC_CLOCK_HZ) / 20.0;
-        case 10: return double(ADC_CLOCK_HZ) / 24.0;
-        default: return 0.0;
-        }
-    }
-    static unsigned rateToHardwareField(double rate)
-    {
-        for (const unsigned field : {7u, 8u, 9u, 10u}) {
-            if (std::abs(rate - hardwareFieldRate(field)) < 1) return field;
-        }
-        throw std::runtime_error(
-            "sample rate must be one of 3.333333, 4, 6.666667, or 8 MSa/s");
-    }
-    static std::vector<double> supportedSampleRates()
-    {
-        return {hardwareFieldRate(10), hardwareFieldRate(9),
-                hardwareFieldRate(8), hardwareFieldRate(7)};
     }
     void applyDutyCycle(unsigned total, unsigned streamed)
     {

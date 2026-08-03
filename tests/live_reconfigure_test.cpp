@@ -16,11 +16,13 @@
 int main(int argc, char **argv)
 {
     if (argc != 2) {
-        std::cerr << "usage: espsdr_live_reconfigure_test HOST\n";
+        std::cerr << "usage: espsdr_live_reconfigure_test HOST_OR_DEVICE_ARGS\n";
         return 2;
     }
+    const std::string selector = argv[1];
     SoapySDR::Device *device = SoapySDR::Device::make(
-        "driver=espsdr,host=" + std::string(argv[1]));
+        "driver=espsdr," +
+        (selector.find('=') == std::string::npos ? "host=" + selector : selector));
     if (device == nullptr) return 1;
     const double oldFrequency = device->getFrequency(SOAPY_SDR_RX, 0);
     const double oldBandwidth = device->getBandwidth(SOAPY_SDR_RX, 0);
@@ -35,7 +37,7 @@ int main(int argc, char **argv)
     std::thread reader;
     int result = 0;
     try {
-        device->setSampleRate(SOAPY_SDR_RX, 0, 4e6);
+        device->setSampleRate(SOAPY_SDR_RX, 0, 2e6);
         stream = device->setupStream(SOAPY_SDR_RX, SOAPY_SDR_CS16);
         if (device->activateStream(stream) != 0) throw std::runtime_error("activateStream failed");
         reader = std::thread([&]() {
@@ -73,8 +75,7 @@ int main(int argc, char **argv)
         change("bandwidth", [&]() { device->setBandwidth(SOAPY_SDR_RX, 0, 21e6); });
         change("agc", [&]() { device->setGainMode(SOAPY_SDR_RX, 0, true); });
         change("manual_gain", [&]() { device->setGain(SOAPY_SDR_RX, 0, 40); });
-        change("sample_rate_4m", [&]() { device->setSampleRate(SOAPY_SDR_RX, 0, 4e6); });
-        change("sample_rate_8m", [&]() { device->setSampleRate(SOAPY_SDR_RX, 0, 8e6); });
+        change("sample_rate_2m", [&]() { device->setSampleRate(SOAPY_SDR_RX, 0, 2e6); });
 
         stop = true;
         reader.join();
@@ -103,11 +104,8 @@ int main(int argc, char **argv)
         device->setBandwidth(SOAPY_SDR_RX, 0, oldBandwidth);
         device->setGain(SOAPY_SDR_RX, 0, oldGain);
         device->setGainMode(SOAPY_SDR_RX, 0, oldAgc);
-        const bool oldRateSupported =
-            std::abs(oldRate - 80e6 / 24.0) < 1 || oldRate == 4e6 ||
-            std::abs(oldRate - 80e6 / 12.0) < 1 || oldRate == 8e6;
         device->setSampleRate(SOAPY_SDR_RX, 0,
-                              oldRateSupported ? oldRate : 4e6);
+                              std::abs(oldRate - 2e6) < 1 ? oldRate : 2e6);
     } catch (const std::exception &error) {
         std::cerr << "restore failed: " << error.what() << '\n';
         result = 1;

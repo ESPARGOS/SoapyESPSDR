@@ -13,10 +13,12 @@
 int main(int argc, char **argv)
 {
     if (argc < 4 || argc > 6) {
-        std::cerr << "usage: espsdr_live_rate_test HOST RATE_HZ SECONDS [CS16|CF32] [CYCLE_TOTAL]\n";
+        std::cerr << "usage: espsdr_live_rate_test HOST_OR_DEVICE_ARGS RATE_HZ SECONDS [CS16|CF32] [CYCLE_TOTAL]\n";
         return 2;
     }
-    const std::string args = "driver=espsdr,host=" + std::string(argv[1]);
+    const std::string selector = argv[1];
+    const std::string args = "driver=espsdr," +
+        (selector.find('=') == std::string::npos ? "host=" + selector : selector);
     const double rate = std::stod(argv[2]);
     const double seconds = std::stod(argv[3]);
     const std::string format = argc >= 5 ? argv[4] : SOAPY_SDR_CS16;
@@ -60,7 +62,7 @@ int main(int argc, char **argv)
         std::cout << '\n';
         // The interval includes firmware stream startup, so allow a small startup
         // deficit while still requiring continuity once packets arrive.
-        if (rate <= 16e6 && (overflows != 0 || received < rate * elapsed * 0.95)) result = 1;
+        if (overflows != 0 || received < rate * elapsed * 0.95) result = 1;
         device->deactivateStream(stream);
         device->closeStream(stream);
         stream = nullptr;

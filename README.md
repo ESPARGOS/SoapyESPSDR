@@ -10,9 +10,10 @@ receiver over either Gigabit Ethernet or the native high-speed USB interface.
 SoapyESPSDR makes that receiver available to applications that support
 SoapySDR, including Gqrx, GNU Radio, and SDR++.
 
-The driver uses HTTP to configure the radio and UDP to receive I/Q samples. It
-checks the firmware sequence numbers for missing samples and reports loss to
-the application as SoapySDR overflow events.
+On Ethernet the driver uses HTTP control and UDP I/Q; on USB it uses the
+firmware's vendor control and bulk-IQ endpoints. It checks firmware and
+transport sequence numbers and reports any missing samples as SoapySDR
+overflow events.
 
 ![ESP-SDR receiving the 2.4 GHz band in Gqrx](assets/gqrx-esp-sdr.png)
 
@@ -23,7 +24,7 @@ the application as SoapySDR overflow events.
 You need:
 
 - An ESP32-S31 Function-CoreBoard running ESP-SDR firmware
-- The board and computer on the same IPv4 network
+- For Ethernet, the board and computer on the same IPv4 network
 - SoapySDR 0.8 development files
 - libcurl, jsoncpp, and zlib development files
 - CMake and a C++17 compiler
@@ -73,14 +74,14 @@ SoapySDRUtil --probe="driver=espsdr,usb=1"
 ```
 
 Select a specific board with `usb_serial=<serial>` (the serial is the base
-MAC address, shown by `--find`). Only one sample stream runs at a time;
-starting a stream over USB replaces an Ethernet stream and vice versa.
+MAC address, shown by `--find`). The firmware is built for either USB or
+Ethernet transport, and only one sample stream runs at a time.
 
-The `CS8` stream format (USB only) selects a compressed int8 wire format
-carrying the top 8 of each 10 sample bits. The verified hardware sample rates
-are 3.333, 4.000, 6.667, and 8.000 MSa/s; 4 MSa/s CS16 is the production
-default and is sustainable by the USB transport. Raw USB device
-access without root requires a udev rule for VID `303a`, for example:
+The `CS8` application format (USB only) returns the top 8 of each 10 sample
+bits. USB normally carries full-precision IQC1 frames and converts them to the
+format requested by the application. The production receiver has a fixed
+2 MSa/s complex rate. Raw USB device access without root requires a udev rule
+for VID `303a`, for example:
 
 ```text
 SUBSYSTEM=="usb", ATTRS{idVendor}=="303a", MODE="0664", GROUP="plugdev", TAG+="uaccess"
@@ -108,10 +109,10 @@ With an explicit address, the string looks like:
 soapy=0,driver=espsdr,host=192.168.0.139
 ```
 
-For native USB use:
+For native USB, select this specific board by serial:
 
 ```text
-soapy=0,driver=espsdr,usb=1
+soapy=0,driver=espsdr,usb_serial=30eda0f3f840
 ```
 
 Apply a measured board-reference correction in ppm in the same string. For the
@@ -124,12 +125,11 @@ soapy=0,driver=espsdr,host=192.168.0.139,frequency_correction_ppm=8.272
 The corresponding USB string is:
 
 ```text
-soapy=0,driver=espsdr,usb=1,frequency_correction_ppm=8.272
+soapy=0,driver=espsdr,usb_serial=30eda0f3f840,frequency_correction_ppm=8.272
 ```
 
-Select 4 MSa/s for the best validated full-precision mode. The firmware reports
-TCM source discontinuities as SoapySDR overflows; it does not silently repeat
-stale samples. If the module is not installed system-wide, launch Gqrx with:
+Select 2 MSa/s in Gqrx. If the module is not installed system-wide, launch Gqrx
+with:
 
 ```sh
 SOAPY_SDR_PLUGIN_PATH=/home/florian/prgm/esp32/SoapyESPSDR/build gqrx
@@ -140,7 +140,7 @@ SOAPY_SDR_PLUGIN_PATH=/home/florian/prgm/esp32/SoapyESPSDR/build gqrx
 - `CS16` native I/Q samples and `CF32` converted samples
 - Center frequencies from 2300 to 2800 MHz, with 1 kHz tuning resolution
 - Signed frontend frequency correction from -100 to +100 ppm
-- Verified hardware sample rates of 3.333, 4.000, 6.667, and 8.000 MSa/s
+- Fixed 2 MSa/s complex sample rate
 - Automatic or manual receive gain
 - Manual receive gain from 0 to 76 dB in 1 dB steps
 - Open/widest or 13–54 MHz analog receive-filter bandwidth
@@ -150,26 +150,9 @@ firmware publishes the available range, unit, and step through its status API,
 and SoapyESPSDR reports those values to applications.
 
 The transport preserves frame ordering and reports missing source chunks,
-firmware drops, and host-queue loss as overflow events. The present S31 TCM
-handoff has one reported source discontinuity per 14-frame full-duty snapshot;
-sparse windows remain contiguous internally.
-
-The `cycle_total` and `cycle_stream` settings control capture duty cycle in
-units of 1,024-sample chunks. For example, `cycle_total=10,cycle_stream=3`
-streams three contiguous chunks followed by seven unstreamed chunks, for a 30%
-duty cycle. Both default to 1 for continuous reception. Deliberately unstreamed
-chunks are not reported as packet loss.
-
-Set these values in the device string so the duty cycle is configured as the
-device is opened:
-
-```text
-soapy=0,driver=espsdr,host=esp-sdr.local,cycle_total=10,cycle_stream=3
-```
-
-Duty-cycle settings remain useful for sparse acquisitions. Monitor the loss
-sensors for every geometry; deliberately unselected chunks are distinct from
-unexpected source or transport loss.
+firmware drops, acquisition overruns, and host-queue loss as overflow events.
+The production PARLIO receiver is full-duty and does not hand the RF source
+through the TCM snapshot aperture.
 
 The analog bandwidth control uses the firmware's Custom/20 MHz digital channel
 path. A bandwidth of zero selects the open/widest response; nonzero values are
@@ -192,12 +175,15 @@ continuously receives samples and reports loss once per configured interval:
 export SOAPY_SDR_PLUGIN_PATH="$PWD/build"
 ./build/espsdr_loss_monitor \
     --host esp-sdr.local \
-    --rate 8000000 \
+    --rate 2000000 \
     --cycle-total 1 \
     --cycle-stream 1 \
     --seconds 30 \
     --interval 1
 ```
+
+For the connected USB board, replace `--host esp-sdr.local` with
+`--device usb_serial=30eda0f3f840`.
 
 The output includes:
 
@@ -224,16 +210,16 @@ The SoapySDR device string accepts these arguments:
 | `http_port` | `80` | Firmware HTTP control port. |
 | `udp_port` | `0` | Local UDP port; zero selects an available ephemeral port. |
 | `rx_buffer_bytes` | `33554432` | Requested operating-system UDP receive-buffer size. |
-| `cycle_total` | `1` | Total chunks per duty-cycle period. |
-| `cycle_stream` | `1` | Contiguous streamed chunks at the start of each period. |
+| `usb` | unset | Select the first attached ESP-SDR USB device when set to `1`. |
+| `usb_serial` | unset | Select one attached ESP-SDR by its lowercase MAC serial. |
+| `cycle_total` | `1` | Legacy/sparse-backend total chunks per duty-cycle period. |
+| `cycle_stream` | `1` | Legacy/sparse-backend streamed chunks per period. |
 | `frequency_correction_ppm` | `0` | Board-specific signed oscillator correction; positive means the ESP LO runs high. |
 
 ## Limitations
 
 - Receive only.
-- One network client at a time.
+- One streaming client at a time.
 - No hardware timestamps or timed streaming.
 - Absolute gain and sensitivity can vary between boards and with frequency.
-- Sample rates above 16 MSa/s generally require a reduced duty cycle when their
-  full data rate exceeds the host or network path's capacity. Applications
-  should monitor the overflow and loss sensors for the chosen cycle geometry.
+- The production receiver currently exposes only 2 MSa/s complex IQ.

@@ -9,10 +9,13 @@
 int main(int argc, char **argv)
 {
     if (argc != 2) {
-        std::cerr << "usage: espsdr_live_control_test HOST\n";
+        std::cerr << "usage: espsdr_live_control_test HOST_OR_DEVICE_ARGS\n";
         return 2;
     }
-    SoapySDR::Device *device = SoapySDR::Device::make("driver=espsdr,host=" + std::string(argv[1]));
+    const std::string selector = argv[1];
+    SoapySDR::Device *device = SoapySDR::Device::make(
+        "driver=espsdr," +
+        (selector.find('=') == std::string::npos ? "host=" + selector : selector));
     if (device == nullptr) return 1;
     const double oldFrequency = device->getFrequency(SOAPY_SDR_RX, 0);
     const double oldCorrection = device->getFrequencyCorrection(SOAPY_SDR_RX, 0);
@@ -44,8 +47,8 @@ int main(int argc, char **argv)
         if (device->readSetting("cycle_total") != "5" ||
             device->readSetting("cycle_stream") != "2") throw std::runtime_error("duty-cycle readback mismatch");
         const std::vector<double> rates = device->listSampleRates(SOAPY_SDR_RX, 0);
-        if (rates.size() != 4 || std::abs(rates.front() - 80e6 / 24.0) > 1 ||
-            rates.back() != 8e6) throw std::runtime_error("sample-rate list mismatch");
+        if (rates.size() != 1 || rates.front() != 2e6)
+            throw std::runtime_error("sample-rate list mismatch");
         std::cout << "frequency, correction, analog bandwidth, gain, duty cycle, and sample rates: OK\n";
     } catch (const std::exception &error) {
         std::cerr << error.what() << '\n';
