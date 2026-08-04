@@ -478,6 +478,12 @@ struct StreamState {
     std::mutex mutex;
     std::condition_variable condition;
     std::deque<SampleBlock> queue;
+    // The production IQC8 stream is strictly ordered and has two fragments
+    // per frame.  Reuse one assembly buffer for that hot path instead of
+    // allocating and updating std::map nodes 31,000 times per second.  The
+    // map remains as the reorder-capable fallback for other wire formats.
+    PendingFrame sequentialPending;
+    bool sequentialPendingActive = false;
     std::map<std::pair<uint32_t, uint32_t>, PendingFrame> pending;
     uint32_t epoch = 0;
     bool haveEpoch = false;
@@ -1015,6 +1021,7 @@ public:
         {
             std::lock_guard<std::mutex> lock(state->mutex);
             state->queue.clear();
+            state->sequentialPendingActive = false;
             state->pending.clear();
             state->overflowPending = false;
             state->haveEpoch = false;
@@ -1623,7 +1630,7 @@ private:
             state->mixerPhase = (state->mixerPhase + 1) & 3u;
         }
     }
-    static void finishFrame(StreamState *state, PendingFrame &&pending)
+    static void finishFrame(StreamState *state, const PendingFrame &pending)
     {
         const bool full = pending.data.size() == IQ_FRAME_BYTES && std::memcmp(pending.data.data(), "IQC1", 4) == 0;
         const bool compressed = pending.data.size() == IQ8_FRAME_BYTES && std::memcmp(pending.data.data(), "IQC8", 4) == 0;
@@ -1720,6 +1727,7 @@ private:
             std::lock_guard<std::mutex> lock(state->mutex);
             state->epoch = header.epoch;
             state->haveEpoch = true;
+            state->sequentialPendingActive = false;
             state->pending.clear();
             state->queue.clear();
             state->haveExpectedSource = false;
@@ -1745,7 +1753,10 @@ private:
                 captureRestart = true;
             }
         }
-        if (captureRestart) state->pending.clear();
+        if (captureRestart) {
+            state->sequentialPendingActive = false;
+            state->pending.clear();
+        }
         if (state->haveMinimumFrameSequence &&
             static_cast<int32_t>(header.frameSequence - state->minimumFrameSequence) < 0) return;
         if (state->haveFirmwareDropped && header.firmwareDropped > state->lastFirmwareDropped) {
@@ -1754,6 +1765,38 @@ private:
         state->lastFirmwareDropped = header.firmwareDropped;
         state->haveFirmwareDropped = true;
         const auto key = std::make_pair(header.epoch, header.frameSequence);
+
+        // Fast production path: Ethernet IQC8 is emitted as two ordered UDP
+        // fragments.  A persistent buffer removes per-frame heap and map
+        // work from the socket-drain thread, leaving substantially more
+        // scheduling margin for short RTL8153 aggregation bursts.
+        if (std::memcmp(header.frameMagic.data(), "IQC8", 4) == 0 &&
+            header.frameBytes == IQ8_FRAME_BYTES && header.fragmentCount == 2) {
+            PendingFrame &sequential = state->sequentialPending;
+            const bool matching = state->sequentialPendingActive &&
+                sequential.first.epoch == header.epoch &&
+                sequential.first.frameSequence == header.frameSequence;
+            if (header.fragmentIndex == 0 &&
+                state->pending.find(key) == state->pending.end()) {
+                sequential.first = header;
+                sequential.data.resize(header.frameBytes);
+                std::memcpy(sequential.data.data() + header.fragmentOffset,
+                            data + UDP_HEADER_BYTES, header.fragmentBytes);
+                sequential.receivedCount = 1;
+                state->sequentialPendingActive = true;
+                return;
+            }
+            if (matching && sequential.receivedCount == 1) {
+                std::memcpy(sequential.data.data() + header.fragmentOffset,
+                            data + UDP_HEADER_BYTES, header.fragmentBytes);
+                sequential.receivedCount = 2;
+                finishFrame(state, sequential);
+                state->sequentialPendingActive = false;
+                return;
+            }
+            // A reordered second fragment is uncommon, but preserve the
+            // generic assembler's ability to join it if fragment zero follows.
+        }
         auto it = state->pending.find(key);
         if (it == state->pending.end()) {
             PendingFrame pending;
@@ -1768,9 +1811,8 @@ private:
         pending.received[header.fragmentIndex] = true;
         pending.receivedCount++;
         if (pending.receivedCount == pending.received.size()) {
-            PendingFrame complete = std::move(pending);
+            finishFrame(state, pending);
             state->pending.erase(it);
-            finishFrame(state, std::move(complete));
         }
         while (state->pending.size() > 128) {
             state->pending.erase(state->pending.begin());
@@ -1780,10 +1822,29 @@ private:
     }
     static void receiveLoop(StreamState *state)
     {
-        std::array<uint8_t, 2048> buffer{};
+        /* Drain a complete NIC/USB aggregation burst per syscall.  At
+         * 16 MSa/s IQC8 produces about 31k UDP datagrams/s; one recv() per
+         * datagram needlessly increases scheduler and RTL8153 RX-ring
+         * pressure, which can drop packets even while SO_RCVBUF is empty. */
+        constexpr unsigned BATCH = 128;
+        std::array<std::array<uint8_t, 2048>, BATCH> buffers{};
+        std::array<iovec, BATCH> iov{};
+        std::array<mmsghdr, BATCH> messages{};
+        for (unsigned i = 0; i < BATCH; ++i) {
+            iov[i].iov_base = buffers[i].data();
+            iov[i].iov_len = buffers[i].size();
+            messages[i].msg_hdr.msg_iov = &iov[i];
+            messages[i].msg_hdr.msg_iovlen = 1;
+        }
         while (!state->stop) {
-            const ssize_t received = recv(state->socketFd, buffer.data(), buffer.size(), 0);
-            if (received > 0) handleDatagram(state, buffer.data(), static_cast<std::size_t>(received));
+            const int received = recvmmsg(state->socketFd, messages.data(),
+                                          BATCH, 0, nullptr);
+            if (received <= 0) continue;
+            for (int i = 0; i < received; ++i) {
+                handleDatagram(state, buffers[static_cast<unsigned>(i)].data(),
+                               messages[static_cast<unsigned>(i)].msg_len);
+                messages[static_cast<unsigned>(i)].msg_len = 0;
+            }
         }
     }
 
