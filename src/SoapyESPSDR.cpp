@@ -5,13 +5,17 @@
 #include <SoapySDR/Registry.hpp>
 #include <SoapySDR/Version.hpp>
 
+#include "TimestampUnwrapper.hpp"
+
 #include <curl/curl.h>
 #include <json/json.h>
 #include <libusb-1.0/libusb.h>
 #include <zlib.h>
 
 #include <arpa/inet.h>
+#include <netdb.h>
 #include <netinet/in.h>
+#include <poll.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
@@ -19,6 +23,7 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <cerrno>
 #include <cmath>
 #include <condition_variable>
 #include <complex>
@@ -28,12 +33,18 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <set>
 #include <stdexcept>
 #include <string>
 #include <thread>
 #include <vector>
 
 namespace {
+
+class TimedTxError : public std::runtime_error {
+public:
+    using std::runtime_error::runtime_error;
+};
 
 constexpr std::size_t UDP_HEADER_BYTES = 52;
 constexpr std::size_t IQ_HEADER_BYTES = 52;
@@ -46,15 +57,66 @@ constexpr std::size_t IQ8_FRAME_BYTES = IQ_HEADER_BYTES + IQ_SAMPLES * 2 + 4;
 constexpr std::size_t REAL8_SAMPLES = IQ_SAMPLES * 4;
 constexpr std::size_t REAL8_FRAME_BYTES = IQ_HEADER_BYTES + REAL8_SAMPLES + 4;
 constexpr std::size_t MAX_BLOCK_SAMPLES = REAL8_SAMPLES / 2;
-constexpr double ETHERNET_SAMPLE_RATE = 16e6;
+constexpr double RX_BASE_SAMPLE_RATE = 16e6;
 constexpr std::size_t MAX_FRAME_BYTES = 64 * 1024;
 // Absorb host-side scheduling stalls without discarding RF frames. At 16 MS/s
 // this provides about 260 ms of elasticity.
 constexpr std::size_t MAX_QUEUE_BLOCKS = 4096;
 constexpr uint32_t UDP_VERSION = 1;
+constexpr uint32_t IQ_FLAG_TIMESTAMP_US32 = 1u << 31;
+constexpr uint32_t IQ_FLAG_SOFTWARE_AGC_ACTIVE = 1u << 30;
+constexpr unsigned IQ_AGC_ROBUST_PEAK_SHIFT = 20;
+constexpr uint32_t IQ_AGC_ROBUST_PEAK_MASK = 0x3ffu;
+constexpr unsigned IQ_AGC_GAIN_CHANGES_SHIFT = 4;
+constexpr uint32_t IQ_AGC_GAIN_CHANGES_MASK = 0xffffu;
+constexpr std::size_t TX_UDP_HEADER_BYTES = 36;
+constexpr std::size_t TX_UDP_ACK_BYTES = 40;
+constexpr std::size_t TX_UDP_WORDS_PER_DATAGRAM = 350;
+constexpr std::size_t TX_REPLAY_SEGMENT_SAMPLES = 16383;
+constexpr std::size_t TX_REPLAY_MAX_SAMPLES = TX_REPLAY_SEGMENT_SAMPLES * 64;
+constexpr uint16_t TX_UDP_FLAG_AUTOSTART = 1u << 8;
+constexpr unsigned TX_UDP_RATE_CODE_SHIFT = 9;
 constexpr unsigned STREAM_SELECTION_MAX = 1'000'000;
 constexpr uint32_t S31_ADC_SOURCE_MUX_MASK = 0x0000000fu;
 constexpr std::size_t REAL_TIMING_TAPS = 25;
+
+/* The six-bit RFTX2 PBUS value is a segmented hardware code, not dB: output
+ * rises inside each eight-code bank and falls at the bank boundary.  These
+ * points are a conservative monotonic subset measured over the air at
+ * 2.38 GHz.  Values are relative power gain from code 1; they intentionally
+ * stop below the vendor calibration code (23), which can brown out a
+ * marginally powered development board. */
+struct TxGainPoint {
+    double db;
+    unsigned code;
+};
+constexpr std::array<TxGainPoint, 15> TX_GAIN_POINTS{{
+    {0.00, 1}, {3.44, 2}, {5.99, 3}, {7.92, 4}, {9.78, 17},
+    {10.85, 6}, {11.97, 7}, {13.14, 18}, {13.98, 12},
+    {15.53, 19}, {16.70, 14}, {17.23, 20}, {17.73, 15},
+    {18.62, 21}, {19.57, 22},
+}};
+
+unsigned txGainCode(const double requestedDb)
+{
+    const auto point = std::min_element(
+        TX_GAIN_POINTS.begin(), TX_GAIN_POINTS.end(),
+        [requestedDb](const TxGainPoint &a, const TxGainPoint &b) {
+            return std::abs(a.db - requestedDb) <
+                   std::abs(b.db - requestedDb);
+        });
+    return point->code;
+}
+
+double txGainDb(const unsigned code)
+{
+    const auto point = std::find_if(
+        TX_GAIN_POINTS.begin(), TX_GAIN_POINTS.end(),
+        [code](const TxGainPoint &candidate) {
+            return candidate.code == code;
+        });
+    return point == TX_GAIN_POINTS.end() ? NAN : point->db;
+}
 // Ignore the first 8 ms after arming (modem AGC/startup transient), then use
 // the following 32 ms for the one-time interleaver calibration.  Every raw
 // frame remains buffered and is released in order after calibration.
@@ -70,11 +132,13 @@ constexpr const char *USB_PRODUCT = "ESP-SDR";
 constexpr uint8_t USB_EP_CTRL_OUT = 0x01;
 constexpr uint8_t USB_EP_CTRL_IN = 0x81;
 constexpr uint8_t USB_EP_STREAM_IN = 0x82;
+constexpr uint8_t USB_EP_TX_OUT = 0x02;
 constexpr std::size_t USB_CTRL_HEADER_BYTES = 16;
 constexpr std::size_t USB_CTRL_MAX_PAYLOAD = 2048;
 constexpr unsigned USB_CTRL_TIMEOUT_MS = 3000;
 constexpr int USB_STREAM_TRANSFERS = 8;
 constexpr std::size_t USB_STREAM_TRANSFER_BYTES = 256 * 1024;
+constexpr std::size_t USB_TX_TRANSFER_BYTES = 60 * 1024;
 
 enum UsbControlOpcode : uint32_t {
     USB_OP_GET_STATUS = 1,
@@ -82,6 +146,9 @@ enum UsbControlOpcode : uint32_t {
     USB_OP_PUT_CONFIG = 3,
     USB_OP_STREAM_START = 4,
     USB_OP_STREAM_STOP = 5,
+    USB_OP_TX_ARM = 6,
+    USB_OP_TX_COMMIT = 7,
+    USB_OP_TX_ABORT = 8,
 };
 
 Json::Value intervalTrigger(unsigned total, unsigned streamed)
@@ -109,6 +176,26 @@ uint32_t le32(const uint8_t *p)
 {
     return uint32_t(p[0]) | (uint32_t(p[1]) << 8) |
            (uint32_t(p[2]) << 16) | (uint32_t(p[3]) << 24);
+}
+
+void putLe16(uint8_t *p, uint16_t value)
+{
+    p[0] = value & 0xff;
+    p[1] = (value >> 8) & 0xff;
+}
+
+void putLe32(uint8_t *p, uint32_t value)
+{
+    p[0] = value & 0xff;
+    p[1] = (value >> 8) & 0xff;
+    p[2] = (value >> 16) & 0xff;
+    p[3] = (value >> 24) & 0xff;
+}
+
+void putLe64(uint8_t *p, uint64_t value)
+{
+    putLe32(p, static_cast<uint32_t>(value));
+    putLe32(p + 4, static_cast<uint32_t>(value >> 32));
 }
 
 int16_t signExtend10(uint32_t value)
@@ -158,7 +245,8 @@ bool jsonContains(const Json::Value &value, const Json::Value &expected)
 
 class HttpClient {
 public:
-    HttpClient(std::string host, unsigned port): _host(std::move(host)), _port(port)
+    HttpClient(std::string host, unsigned port, std::string interface = {}):
+        _host(std::move(host)), _port(port), _interface(std::move(interface))
     {
         static const int initialized = []() { return curl_global_init(CURL_GLOBAL_DEFAULT); }();
         if (initialized != CURLE_OK) throw std::runtime_error("curl_global_init failed");
@@ -201,6 +289,9 @@ private:
         curl_easy_setopt(curl.get(), CURLOPT_CONNECTTIMEOUT_MS, 1500L);
         curl_easy_setopt(curl.get(), CURLOPT_TIMEOUT_MS, 5000L);
         curl_easy_setopt(curl.get(), CURLOPT_NOSIGNAL, 1L);
+        if (!_interface.empty())
+            curl_easy_setopt(curl.get(), CURLOPT_INTERFACE,
+                             _interface.c_str());
         const CURLcode result = curl_easy_perform(curl.get());
         if (result != CURLE_OK) {
             throw std::runtime_error("HTTP request to " + url + " failed: " + curl_easy_strerror(result));
@@ -215,6 +306,7 @@ private:
 
     std::string _host;
     unsigned _port;
+    std::string _interface;
 };
 
 // Abstract control plane: HTTP JSON API or the equivalent USB channel.
@@ -228,7 +320,8 @@ public:
 
 class HttpControl final : public Control {
 public:
-    HttpControl(std::string host, unsigned port): _http(std::move(host), port) {}
+    HttpControl(std::string host, unsigned port, std::string interface):
+        _http(std::move(host), port, std::move(interface)) {}
     Json::Value get(const std::string &path) override { return _http.get(path); }
     Json::Value put(const std::string &path, const Json::Value &body) override { return _http.put(path, body); }
     Json::Value post(const std::string &path, const Json::Value &body) override { return _http.post(path, body); }
@@ -251,6 +344,15 @@ struct UsbContext {
         if (context != nullptr) libusb_exit(context);
     }
 };
+
+void bindSocketToInterface(int fd, const std::string &interface)
+{
+    if (interface.empty()) return;
+    if (setsockopt(fd, SOL_SOCKET, SO_BINDTODEVICE, interface.c_str(),
+                   interface.size() + 1) != 0)
+        throw std::runtime_error("cannot bind socket to interface " +
+                                 interface + ": " + std::strerror(errno));
+}
 
 std::string usbStringDescriptor(libusb_device_handle *handle, uint8_t index)
 {
@@ -323,22 +425,43 @@ public:
         throw std::runtime_error("unsupported USB control path: " + path);
     }
 
+    Json::Value rawRequest(uint32_t opcode, const uint8_t *payload,
+                           std::size_t payloadBytes)
+    {
+        return requestBytes(opcode, payload, payloadBytes);
+    }
+
 private:
     Json::Value request(uint32_t opcode, const Json::Value *body)
     {
+        const std::string payload = body != nullptr ? jsonString(*body) : std::string();
+        return requestBytes(opcode,
+                            reinterpret_cast<const uint8_t *>(payload.data()),
+                            payload.size());
+    }
+
+    Json::Value requestBytes(uint32_t opcode, const uint8_t *payload,
+                             std::size_t payloadBytes)
+    {
         std::lock_guard<std::mutex> lock(_mutex);
-        std::string payload = body != nullptr ? jsonString(*body) : std::string();
-        if (payload.size() > USB_CTRL_MAX_PAYLOAD) throw std::runtime_error("USB control payload too large");
+        if (payloadBytes > USB_CTRL_MAX_PAYLOAD)
+            throw std::runtime_error("USB control payload too large");
+        if (payloadBytes != 0 && payload == nullptr)
+            throw std::runtime_error("USB control payload is null");
         // Keep the request off exact packet-size multiples so the transfer
-        // always terminates with a short packet.
-        if ((USB_CTRL_HEADER_BYTES + payload.size()) % 512 == 0) payload.push_back(' ');
+        // always terminates with a short packet. Padding is outside the
+        // logical payload so binary control messages remain exact.
+        const std::size_t padding =
+            (USB_CTRL_HEADER_BYTES + payloadBytes) % 512 == 0 ? 1 : 0;
         const uint32_t sequence = ++_sequence;
-        std::vector<uint8_t> out(USB_CTRL_HEADER_BYTES + payload.size());
+        std::vector<uint8_t> out(USB_CTRL_HEADER_BYTES + payloadBytes + padding);
         std::memcpy(out.data(), "IQRQ", 4);
-        writeLe32(out.data() + 4, sequence);
-        writeLe32(out.data() + 8, opcode);
-        writeLe32(out.data() + 12, static_cast<uint32_t>(payload.size()));
-        std::memcpy(out.data() + USB_CTRL_HEADER_BYTES, payload.data(), payload.size());
+        putLe32(out.data() + 4, sequence);
+        putLe32(out.data() + 8, opcode);
+        putLe32(out.data() + 12, static_cast<uint32_t>(payloadBytes));
+        if (payloadBytes != 0)
+            std::memcpy(out.data() + USB_CTRL_HEADER_BYTES, payload,
+                        payloadBytes);
         int transferred = 0;
         int status = libusb_bulk_transfer(_usb->handle, USB_EP_CTRL_OUT, out.data(),
                                           static_cast<int>(out.size()), &transferred, USB_CTRL_TIMEOUT_MS);
@@ -355,21 +478,16 @@ private:
             throw std::runtime_error("USB control response out of sync");
         }
         const uint32_t errorStatus = le32(in.data() + 8);
-        const uint32_t payloadBytes = le32(in.data() + 12);
-        if (USB_CTRL_HEADER_BYTES + payloadBytes > static_cast<std::size_t>(transferred)) {
+        const uint32_t responsePayloadBytes = le32(in.data() + 12);
+        if (USB_CTRL_HEADER_BYTES + responsePayloadBytes >
+            static_cast<std::size_t>(transferred)) {
             throw std::runtime_error("USB control response truncated");
         }
-        const std::string text(reinterpret_cast<char *>(in.data()) + USB_CTRL_HEADER_BYTES, payloadBytes);
+        const std::string text(
+            reinterpret_cast<char *>(in.data()) + USB_CTRL_HEADER_BYTES,
+            responsePayloadBytes);
         if (errorStatus != 0) throw std::runtime_error("ESP-SDR USB control error: " + text);
         return text.empty() ? Json::Value(Json::objectValue) : parseJson(text);
-    }
-
-    static void writeLe32(uint8_t *p, uint32_t value)
-    {
-        p[0] = value & 0xff;
-        p[1] = (value >> 8) & 0xff;
-        p[2] = (value >> 16) & 0xff;
-        p[3] = (value >> 24) & 0xff;
     }
 
     std::shared_ptr<UsbContext> _usb;
@@ -428,7 +546,17 @@ struct SampleBlock {
     std::array<int16_t, MAX_BLOCK_SAMPLES * 2> iq{};
     std::size_t offset = 0;
     std::size_t samples = IQ_SAMPLES;
+    uint64_t timeNs = 0;
+    uint32_t sampleRateHz = 0;
+    bool hasTime = false;
 };
+
+struct RxDatagram {
+    std::array<uint8_t, 2048> data{};
+    uint16_t bytes = 0;
+};
+
+constexpr uint32_t RX_DATAGRAM_RING_SIZE = 8192;
 
 // 95-tap equiripple half-band filter: 7.2 MHz passband, 8.8 MHz stopband at
 // 32 MS/s, 0.0015 dB ripple and >81 dB image rejection. Every other tap is
@@ -466,6 +594,7 @@ constexpr std::array<float, REAL_TIMING_TAPS> REAL_TIMING_PHASE = {{
 }};
 
 struct StreamState {
+    int direction = SOAPY_SDR_RX;
     std::string format;
     int socketFd = -1;
     uint16_t port = 0;
@@ -475,9 +604,27 @@ struct StreamState {
     std::atomic<bool> active{false};
     std::atomic<bool> stop{false};
     std::thread worker;
+    std::thread decoderWorker;
+    std::vector<RxDatagram> rxDatagramRing;
+    std::atomic<uint32_t> rxDatagramHead{0};
+    std::atomic<uint32_t> rxDatagramTail{0};
+    std::mutex rxWakeMutex;
+    std::condition_variable rxWakeCondition;
     std::mutex mutex;
     std::condition_variable condition;
     std::deque<SampleBlock> queue;
+    // Consecutive TX writes without a boundary flag are fragments of one
+    // finite hardware replay batch. This avoids turning the small buffers
+    // used by ordinary Soapy applications into separate RF/config bursts.
+    std::mutex txWriteMutex;
+    std::vector<uint32_t> txPendingWords;
+    std::atomic<uint32_t> txBufferedSamples{0};
+    bool txPendingHasTime = false;
+    long long txPendingStartTimeNs = 0;
+    long long txPendingActualTimeNs = 0;
+    // writeStream() is synchronous, so a successful finite burst has already
+    // reached RF when it is reported through readStreamStatus().
+    std::deque<std::pair<bool, long long>> txBurstStatuses;
     // The production IQC8 stream is strictly ordered and has two fragments
     // per frame.  Reuse one assembly buffer for that hot path instead of
     // allocating and updating std::map nodes 31,000 times per second.  The
@@ -487,8 +634,13 @@ struct StreamState {
     std::map<std::pair<uint32_t, uint32_t>, PendingFrame> pending;
     uint32_t epoch = 0;
     bool haveEpoch = false;
+    uint32_t expectedDatagramSequence = 0;
+    uint32_t lastDatagramSequence = 0;
+    bool haveDatagramSequence = false;
+    std::set<uint32_t> missingDatagramSequences;
     uint32_t expectedSource = 0;
     bool haveExpectedSource = false;
+    espsdr::TimestampUnwrapper timestampUnwrapper;
     uint32_t minimumFrameSequence = 0;
     bool haveMinimumFrameSequence = false;
     uint32_t lastFirmwareDropped = 0;
@@ -496,11 +648,23 @@ struct StreamState {
     bool overflowPending = false;
     std::atomic<uint64_t> datagrams{0};
     std::atomic<uint64_t> invalidDatagrams{0};
+    std::atomic<uint64_t> duplicateDatagrams{0};
+    std::atomic<uint64_t> reorderedDatagrams{0};
+    std::atomic<uint64_t> datagramGaps{0};
+    std::atomic<uint64_t> lateDatagramsRecovered{0};
+    std::atomic<uint64_t> unrecoveredDatagramGaps{0};
     std::atomic<uint64_t> completedFrames{0};
     std::atomic<uint64_t> lostChunks{0};
     std::atomic<uint64_t> firmwareDrops{0};
     std::atomic<uint64_t> queueDrops{0};
     std::atomic<uint64_t> captureRestarts{0};
+    // Receiver-control telemetry arrives in every IQ frame. This avoids HTTP
+    // status traffic competing with full-rate Ethernet samples.
+    std::atomic<bool> haveRxTelemetry{false};
+    std::atomic<bool> rxSoftwareAgcActive{false};
+    std::atomic<uint32_t> rxGain{0};
+    std::atomic<uint32_t> rxAgcRobustPeak{0};
+    std::atomic<uint32_t> rxAgcGainChanges{0};
     std::atomic<int64_t> suppressContinuityUntilNs{0};
     std::atomic<unsigned> cycleTotal{1};
     std::atomic<unsigned> cycleStream{1};
@@ -517,12 +681,15 @@ struct StreamState {
     std::atomic<int> timingSkewPpm{0};
     std::atomic<int> timingOddGainPpm{1'000'000};
     std::vector<std::array<int8_t, REAL8_SAMPLES>> timingCalibration;
+    std::vector<uint64_t> timingCalibrationTimeNs;
+    std::vector<uint32_t> timingCalibrationRateHz;
 };
 
 class EspDevice final : public SoapySDR::Device {
 public:
     explicit EspDevice(const SoapySDR::Kwargs &args):
         _host(valueOr(args, "host", "esp-sdr.local")),
+        _interface(valueOr(args, "interface", "")),
         _httpPort(parseUnsigned(valueOr(args, "http_port", "80"), "http_port", 1, 65535)),
         _requestedUdpPort(parseUnsigned(valueOr(args, "udp_port", "0"), "udp_port", 0, 65535)),
         _rxBufferBytes(parseUnsigned(valueOr(args, "rx_buffer_bytes", "33554432"), "rx_buffer_bytes", 65536, 268435456)),
@@ -536,16 +703,38 @@ public:
             _usb = usbOpen(usbSerial);
             _control = std::make_unique<UsbControl>(_usb);
         } else {
-            _control = std::make_unique<HttpControl>(_host, _httpPort);
+            _control = std::make_unique<HttpControl>(_host, _httpPort,
+                                                     _interface);
         }
         _config = _control->get("/api/v1/config");
         if (!_config.isObject()) throw std::runtime_error("ESP-SDR returned an invalid configuration");
         const Json::Value status = _control->get("/api/v1/status");
+        _status = status;
+        _statusRefreshNs = monotonicNanoseconds();
+        if (status.isMember("hardware_time_ns")) {
+            _hardwareTimeAnchorNs = status["hardware_time_ns"].asInt64();
+            _hardwareTimeHostAnchorNs = _statusRefreshNs;
+            _haveHardwareTime = true;
+        }
+        _txUdpAutostart = status.get("tx_udp_autostart", false).asBool();
         const Json::Value gain = status["manual_rx_gain"];
         if (gain.isObject() && gain["unit"].asString() == "dB") {
             _gainMin = gain.get("minimum", 0.0).asDouble();
             _gainMax = gain.get("maximum", 76.0).asDouble();
             _gainStep = gain.get("step", 1.0).asDouble();
+        }
+        if (args.find("cycle_total") == args.end() &&
+            args.find("cycle_stream") == args.end()) {
+            const Json::Value trigger = _config["trigger"]["trigger_config"];
+            if (trigger.isArray() && trigger.size() >= 3) {
+                const unsigned total = trigger[0].asUInt();
+                const unsigned streamed = trigger[2].asUInt();
+                if (total >= 1 && total <= STREAM_SELECTION_MAX &&
+                    streamed >= 1 && streamed <= total) {
+                    _cycleTotal = total;
+                    _cycleStream = streamed;
+                }
+            }
         }
         const auto correction = args.find("frequency_correction_ppm");
         if (correction != args.end()) {
@@ -554,14 +743,14 @@ public:
                                                "frequency_correction_ppm",
                                                -100.0, 100.0));
         }
-        applyDutyCycle(_cycleTotal, _cycleStream);
     }
 
     ~EspDevice() override
     {
-        if (_stream != nullptr) {
-            try { deactivateStream(reinterpret_cast<SoapySDR::Stream *>(_stream), 0, 0); } catch (...) {}
-            closeStream(reinterpret_cast<SoapySDR::Stream *>(_stream));
+        for (StreamState *stream : {_rxStream, _txStream}) {
+            if (stream == nullptr) continue;
+            try { deactivateStream(reinterpret_cast<SoapySDR::Stream *>(stream), 0, 0); } catch (...) {}
+            closeStream(reinterpret_cast<SoapySDR::Stream *>(stream));
         }
     }
 
@@ -571,100 +760,189 @@ public:
     {
         if (_usb != nullptr) {
             return {{"vendor", "Espressif"}, {"hardware", "ESP32-S31 Function-CoreBoard"},
-                    {"usb_serial", _usb->serial}, {"transport", "USB control / USB IQ"}};
+                    {"usb_serial", _usb->serial},
+                    {"transport", "USB control / USB RX / USB TX"}};
         }
         return {{"vendor", "Espressif"}, {"hardware", "ESP32-S31 Function-CoreBoard"},
                 {"host", _host}, {"transport", "HTTP control / UDP IQ"}};
     }
-    std::size_t getNumChannels(const int direction) const override { return direction == SOAPY_SDR_RX ? 1 : 0; }
+
+    bool hasHardwareTime(const std::string &what = "") const override
+    {
+        if (!what.empty()) return false;
+        std::lock_guard<std::mutex> lock(_statusMutex);
+        return _haveHardwareTime;
+    }
+    long long getHardwareTime(const std::string &what = "") const override
+    {
+        if (!what.empty())
+            throw std::runtime_error("unknown hardware time source: " + what);
+        std::lock_guard<std::mutex> lock(_statusMutex);
+        if (!_haveHardwareTime)
+            throw std::runtime_error("firmware does not provide hardware time");
+        return _hardwareTimeAnchorNs +
+               (monotonicNanoseconds() - _hardwareTimeHostAnchorNs);
+    }
+    std::size_t getNumChannels(const int direction) const override
+    {
+        if (direction == SOAPY_SDR_RX) return 1;
+        return direction == SOAPY_SDR_TX ? 1 : 0;
+    }
     bool getFullDuplex(const int, const std::size_t) const override { return false; }
-    bool hasGainMode(const int direction, const std::size_t channel) const override { checkRx(direction, channel); return true; }
+    std::vector<std::string> listAntennas(
+        const int direction, const std::size_t channel) const override
+    {
+        checkChannel(direction, channel);
+        return {"RF"};
+    }
+    void setAntenna(const int direction, const std::size_t channel,
+                    const std::string &name) override
+    {
+        checkChannel(direction, channel);
+        if (name != "RF")
+            throw std::runtime_error("ESP-SDR exposes only the shared RF port");
+    }
+    std::string getAntenna(const int direction,
+                           const std::size_t channel) const override
+    {
+        checkChannel(direction, channel);
+        return "RF";
+    }
+    bool hasGainMode(const int direction, const std::size_t channel) const override
+    {
+        checkChannel(direction, channel);
+        return direction == SOAPY_SDR_RX;
+    }
     void setGainMode(const int direction, const std::size_t channel, const bool automatic) override
     {
-        checkRx(direction, channel);
+        checkChannel(direction, channel);
+        if (direction == SOAPY_SDR_TX) {
+            if (automatic) throw std::runtime_error("TX gain is manual");
+            return;
+        }
         Json::Value patch;
         patch["gain"]["gain_mode"] = automatic ? 0 : 1;
         applyPatch(patch);
     }
     bool getGainMode(const int direction, const std::size_t channel) const override
     {
-        checkRx(direction, channel);
+        checkChannel(direction, channel);
+        if (direction == SOAPY_SDR_TX) return false;
         return configUInt("gain", "gain_mode", 1) == 0;
     }
     std::vector<std::string> listGains(const int direction, const std::size_t channel) const override
     {
-        checkRx(direction, channel);
-        return {"RX Gain"};
+        checkChannel(direction, channel);
+        return {direction == SOAPY_SDR_RX ? "RX Gain" : "TX Gain"};
     }
     void setGain(const int direction, const std::size_t channel, const double value) override
     {
-        setGain(direction, channel, "RX Gain", value);
+        setGain(direction, channel,
+                direction == SOAPY_SDR_RX ? "RX Gain" : "TX Gain", value);
     }
     void setGain(const int direction, const std::size_t channel, const std::string &name, const double value) override
     {
-        checkRx(direction, channel);
-        if (name != "RX Gain") throw std::runtime_error("unknown gain element: " + name);
+        checkChannel(direction, channel);
+        const char *expected = direction == SOAPY_SDR_RX ? "RX Gain" : "TX Gain";
+        if (name != expected) throw std::runtime_error("unknown gain element: " + name);
+        if (!std::isfinite(value))
+            throw std::runtime_error("gain must be finite");
         Json::Value patch;
-        patch["gain"]["gain_mode"] = 1;
-        patch["gain"]["rx_gain"] = static_cast<unsigned>(
-            std::clamp(std::round(value), _gainMin, _gainMax));
+        if (direction == SOAPY_SDR_RX) {
+            patch["gain"]["gain_mode"] = 1;
+            patch["gain"]["rx_gain"] = static_cast<unsigned>(
+                std::clamp(std::round(value), _gainMin, _gainMax));
+        } else {
+            patch["gain"]["tx_gain"] = txGainCode(std::clamp(
+                value, TX_GAIN_POINTS.front().db,
+                TX_GAIN_POINTS.back().db));
+        }
         applyPatch(patch);
     }
     double getGain(const int direction, const std::size_t channel) const override
     {
-        return getGain(direction, channel, "RX Gain");
+        return getGain(direction, channel,
+                       direction == SOAPY_SDR_RX ? "RX Gain" : "TX Gain");
     }
     double getGain(const int direction, const std::size_t channel, const std::string &name) const override
     {
-        checkRx(direction, channel);
-        if (name != "RX Gain") throw std::runtime_error("unknown gain element: " + name);
-        return configUInt("gain", "rx_gain", 32);
+        checkChannel(direction, channel);
+        const char *expected = direction == SOAPY_SDR_RX ? "RX Gain" : "TX Gain";
+        if (name != expected) throw std::runtime_error("unknown gain element: " + name);
+        return direction == SOAPY_SDR_RX
+                   ? configUInt("gain", "rx_gain", 32)
+                   : txGainDb(configUInt("gain", "tx_gain", 4));
     }
     SoapySDR::Range getGainRange(const int direction, const std::size_t channel) const override
     {
-        return getGainRange(direction, channel, "RX Gain");
+        return getGainRange(direction, channel,
+                            direction == SOAPY_SDR_RX ? "RX Gain" : "TX Gain");
     }
     SoapySDR::Range getGainRange(const int direction, const std::size_t channel, const std::string &name) const override
     {
-        checkRx(direction, channel);
-        if (name != "RX Gain") throw std::runtime_error("unknown gain element: " + name);
-        return {_gainMin, _gainMax, _gainStep};
+        checkChannel(direction, channel);
+        const char *expected = direction == SOAPY_SDR_RX ? "RX Gain" : "TX Gain";
+        if (name != expected) throw std::runtime_error("unknown gain element: " + name);
+        return direction == SOAPY_SDR_RX
+                   ? SoapySDR::Range(_gainMin, _gainMax, _gainStep)
+                   : SoapySDR::Range(TX_GAIN_POINTS.front().db,
+                                     TX_GAIN_POINTS.back().db);
     }
 
     void setFrequency(const int direction, const std::size_t channel, const double frequency,
                       const SoapySDR::Kwargs &) override
     {
-        checkRx(direction, channel);
+        checkChannel(direction, channel);
         if (frequency < 2.3e9 || frequency > 2.8e9) throw std::runtime_error("frequency must be 2300-2800 MHz");
         Json::Value patch;
         patch["radio"]["rf_freq_hz"] = Json::UInt64(std::llround(frequency / 1000.0) * 1000);
         applyPatch(patch);
     }
+    void setFrequency(const int direction, const std::size_t channel,
+                      const std::string &name, const double frequency,
+                      const SoapySDR::Kwargs &args) override
+    {
+        if (name != "RF") throw std::runtime_error("unknown frequency element: " + name);
+        setFrequency(direction, channel, frequency, args);
+    }
     double getFrequency(const int direction, const std::size_t channel) const override
     {
-        checkRx(direction, channel);
+        checkChannel(direction, channel);
         return configUInt64("radio", "rf_freq_hz", 2412000000u);
+    }
+    double getFrequency(const int direction, const std::size_t channel,
+                        const std::string &name) const override
+    {
+        if (name != "RF") throw std::runtime_error("unknown frequency element: " + name);
+        return getFrequency(direction, channel);
     }
     std::vector<std::string> listFrequencies(const int direction, const std::size_t channel) const override
     {
-        checkRx(direction, channel);
+        checkChannel(direction, channel);
         return {"RF"};
     }
     SoapySDR::RangeList getFrequencyRange(const int direction, const std::size_t channel) const override
     {
-        checkRx(direction, channel);
+        checkChannel(direction, channel);
         return {{2.3e9, 2.8e9, 1000}};
+    }
+    SoapySDR::RangeList getFrequencyRange(
+        const int direction, const std::size_t channel,
+        const std::string &name) const override
+    {
+        if (name != "RF") throw std::runtime_error("unknown frequency element: " + name);
+        return getFrequencyRange(direction, channel);
     }
 
     bool hasFrequencyCorrection(const int direction, const std::size_t channel) const override
     {
-        checkRx(direction, channel);
+        checkChannel(direction, channel);
         return true;
     }
     void setFrequencyCorrection(const int direction, const std::size_t channel,
                                 const double value) override
     {
-        checkRx(direction, channel);
+        checkChannel(direction, channel);
         if (!std::isfinite(value) || value < -100.0 || value > 100.0)
             throw std::runtime_error("frequency correction must be -100..100 ppm");
         Json::Value patch;
@@ -675,39 +953,49 @@ public:
     double getFrequencyCorrection(const int direction,
                                   const std::size_t channel) const override
     {
-        checkRx(direction, channel);
+        checkChannel(direction, channel);
         return configInt64("radio", "frequency_correction_ppb", 0) / 1000.0;
     }
 
     void setSampleRate(const int direction, const std::size_t channel, const double rate) override
     {
-        checkRx(direction, channel);
-        const double supported = _usb == nullptr ? ETHERNET_SAMPLE_RATE : 2e6;
-        if (std::abs(rate - supported) >= 1)
-            throw std::runtime_error("sample rate must be " +
-                                     std::to_string(supported / 1e6) +
-                                     " MSa/s for this transport");
+        checkChannel(direction, channel);
+        if (direction == SOAPY_SDR_TX) {
+            for (const double supported : txSampleRates()) {
+                if (std::abs(rate - supported) < 1000.0) {
+                    _txSampleRate = supported;
+                    return;
+                }
+            }
+            throw std::runtime_error("unsupported TX sample rate");
+        }
+        const unsigned divisor = rxRateDivisor(rate);
         Json::Value patch;
-        patch["iq_engine"]["adc_decimation"] = _usb == nullptr ? 1 : 2;
-        patch["rx_filter"]["rx_filter_override"] = _usb == nullptr ? 62 : 0;
+        patch["iq_engine"]["adc_decimation"] = divisor;
         applyPatch(patch);
     }
     double getSampleRate(const int direction, const std::size_t channel) const override
     {
-        checkRx(direction, channel);
-        return _usb == nullptr ? ETHERNET_SAMPLE_RATE : 2e6;
+        checkChannel(direction, channel);
+        if (direction == SOAPY_SDR_TX) return _txSampleRate;
+        const auto divisor = static_cast<unsigned>(std::clamp<int64_t>(
+            configInt64("iq_engine", "adc_decimation", 1), 1, 10));
+        return RX_BASE_SAMPLE_RATE / divisor;
     }
     std::vector<double> listSampleRates(const int direction, const std::size_t channel) const override
     {
-        checkRx(direction, channel);
-        return {getSampleRate(direction, channel)};
+        checkChannel(direction, channel);
+        return direction == SOAPY_SDR_TX ? txSampleRates() : rxSampleRates();
     }
     SoapySDR::RangeList getSampleRateRange(const int direction, const std::size_t channel) const override
     {
-        checkRx(direction, channel);
+        checkChannel(direction, channel);
         SoapySDR::RangeList ranges;
-        const double rate = getSampleRate(direction, channel);
-        ranges.emplace_back(rate, rate);
+        if (direction == SOAPY_SDR_TX) {
+            for (const double rate : txSampleRates()) ranges.emplace_back(rate, rate);
+            return ranges;
+        }
+        for (const double rate : rxSampleRates()) ranges.emplace_back(rate, rate);
         return ranges;
     }
 
@@ -715,7 +1003,7 @@ public:
     {
         SoapySDR::ArgInfo total;
         total.key = "cycle_total";
-        total.value = "1";
+        total.value = std::to_string(_cycleTotal.load());
         total.name = "Duty cycle: total chunks";
         total.description = "Total number of chunks in one capture cycle";
         total.units = "chunks";
@@ -723,6 +1011,7 @@ public:
         total.range = SoapySDR::Range(1, STREAM_SELECTION_MAX, 1);
         SoapySDR::ArgInfo streamed = total;
         streamed.key = "cycle_stream";
+        streamed.value = std::to_string(_cycleStream.load());
         streamed.name = "Duty cycle: streamed chunks";
         streamed.description = "Number of contiguous chunks streamed at the start of each capture cycle";
 
@@ -735,11 +1024,22 @@ public:
         correction.type = SoapySDR::ArgInfo::FLOAT;
         correction.range = SoapySDR::Range(-100, 100);
 
+        SoapySDR::ArgInfo txGainCodeInfo;
+        txGainCodeInfo.key = "tx_gain_code";
+        txGainCodeInfo.value = std::to_string(
+            configUInt("gain", "tx_gain", 4));
+        txGainCodeInfo.name = "Expert raw TX gain code";
+        txGainCodeInfo.description =
+            "Raw segmented six-bit RFTX2 PBUS code; non-monotonic and "
+            "potentially unsafe above the characterized range";
+        txGainCodeInfo.type = SoapySDR::ArgInfo::INT;
+        txGainCodeInfo.range = SoapySDR::Range(0, 63, 1);
+
         SoapySDR::ArgInfo filterOverride;
         filterOverride.key = "rx_filter_override";
         filterOverride.value = "0";
         filterOverride.name = "Expert RX filter override";
-        filterOverride.description = "0=calibrated complex path; 62=32 MS/s real PARLIO plus host analytic conversion";
+        filterOverride.description = "Raw firmware path override; normal applications should leave this under driver control";
         filterOverride.type = SoapySDR::ArgInfo::INT;
         filterOverride.range = SoapySDR::Range(0, 62, 1);
 
@@ -802,7 +1102,8 @@ public:
         loopBbGain.value = "63";
         loopBbGain.name = "Diagnostic loopback BB gain";
 
-        return {total, streamed, correction, filterOverride, filterMode, filterDcap, adcSource,
+        return {total, streamed, correction, txGainCodeInfo,
+                filterOverride, filterMode, filterDcap, adcSource,
                 loopback, toneEnable, toneStep, loopTxGain, loopRxGain, loopBbGain};
     }
     void writeSetting(const std::string &key, const std::string &value) override
@@ -819,6 +1120,12 @@ public:
             setFrequencyCorrection(SOAPY_SDR_RX, 0,
                                    parseDouble(value, "frequency_correction_ppm",
                                                -100.0, 100.0));
+            return;
+        } else if (key == "tx_gain_code") {
+            Json::Value patch;
+            patch["gain"]["tx_gain"] =
+                parseUnsigned(value, "tx_gain_code", 0, 63);
+            applyPatch(patch);
             return;
         } else if (key == "rx_filter_override") {
             Json::Value patch;
@@ -884,6 +1191,8 @@ public:
         if (key == "cycle_stream") return std::to_string(_cycleStream.load());
         if (key == "frequency_correction_ppm") return std::to_string(
             getFrequencyCorrection(SOAPY_SDR_RX, 0));
+        if (key == "tx_gain_code") return std::to_string(
+            configUInt("gain", "tx_gain", 4));
         if (key == "rx_filter_override") return std::to_string(configUInt("rx_filter", "rx_filter_override", 0));
         if (key == "rx_filter_mode") return std::to_string(configUInt("rx_filter", "rx_filter_mode", 16));
         if (key == "rx_filter_dcap") return std::to_string(configUInt("rx_filter", "rx_filter_dcap", 60));
@@ -899,7 +1208,17 @@ public:
 
     void setBandwidth(const int direction, const std::size_t channel, const double bandwidth) override
     {
-        checkRx(direction, channel);
+        checkChannel(direction, channel);
+        if (direction == SOAPY_SDR_TX) {
+            const unsigned mhz = static_cast<unsigned>(std::llround(bandwidth / 1e6));
+            if (mhz != 20)
+                throw std::runtime_error("TX bandwidth is fixed at 20 MHz");
+            Json::Value patch;
+            patch["bandwidth"]["bw_mhz"] = mhz;
+            patch["bandwidth"]["second_chan"] = 0;
+            applyPatch(patch);
+            return;
+        }
         unsigned mhz = 0;
         if (bandwidth != 0) {
             mhz = static_cast<unsigned>(std::llround(bandwidth / 1e6));
@@ -910,58 +1229,77 @@ public:
         patch["bandwidth"]["bw_mhz"] = 20;
         patch["bandwidth"]["second_chan"] = 0;
         patch["rx_filter"]["filter_bw_mhz"] = mhz;
-        patch["rx_filter"]["rx_filter_override"] = _usb == nullptr ? 62 : 0;
+        patch["rx_filter"]["rx_filter_override"] = 62;
         applyPatch(patch);
     }
     double getBandwidth(const int direction, const std::size_t channel) const override
     {
-        checkRx(direction, channel);
-        return configUInt("rx_filter", "filter_bw_mhz", 0) * 1e6;
+        checkChannel(direction, channel);
+        return configUInt(direction == SOAPY_SDR_RX ? "rx_filter" : "bandwidth",
+                          direction == SOAPY_SDR_RX ? "filter_bw_mhz" : "bw_mhz",
+                          direction == SOAPY_SDR_RX ? 0 : 20) * 1e6;
     }
     std::vector<double> listBandwidths(const int direction, const std::size_t channel) const override
     {
-        checkRx(direction, channel);
+        checkChannel(direction, channel);
+        if (direction == SOAPY_SDR_TX) return {20e6};
         std::vector<double> values{0};
         for (unsigned mhz = 13; mhz <= 54; ++mhz) values.push_back(mhz * 1e6);
         return values;
     }
     SoapySDR::RangeList getBandwidthRange(const int direction, const std::size_t channel) const override
     {
-        checkRx(direction, channel);
-        return {{13e6, 54e6, 1e6}};
+        checkChannel(direction, channel);
+        return direction == SOAPY_SDR_TX ? SoapySDR::RangeList{{20e6, 20e6}}
+                                         : SoapySDR::RangeList{{13e6, 54e6, 1e6}};
     }
 
     std::vector<std::string> getStreamFormats(const int direction, const std::size_t channel) const override
     {
-        checkRx(direction, channel);
+        checkChannel(direction, channel);
         return {SOAPY_SDR_CS16, SOAPY_SDR_CF32, SOAPY_SDR_CS8};
     }
     std::string getNativeStreamFormat(const int direction, const std::size_t channel, double &fullScale) const override
     {
-        checkRx(direction, channel);
-        fullScale = 512.0;
+        checkChannel(direction, channel);
+        fullScale = direction == SOAPY_SDR_TX ? 32768.0 : 512.0;
         return SOAPY_SDR_CS16;
     }
     SoapySDR::Stream *setupStream(const int direction, const std::string &format,
                                   const std::vector<std::size_t> &channels,
                                   const SoapySDR::Kwargs &) override
     {
-        checkRx(direction, channels.empty() ? 0 : channels.front());
-        if (channels.size() > 1) throw std::runtime_error("SoapyESPSDR has one RX channel");
+        checkChannel(direction, channels.empty() ? 0 : channels.front());
+        if (channels.size() > 1) throw std::runtime_error("SoapyESPSDR has one channel per direction");
         if (format != SOAPY_SDR_CS8 && format != SOAPY_SDR_CS16 &&
             format != SOAPY_SDR_CF32) {
             throw std::runtime_error("supported formats are CS16, CF32, and CS8");
         }
-        if (_stream != nullptr) throw std::runtime_error("only one RX stream is supported");
+        StreamState *&streamSlot = direction == SOAPY_SDR_RX ? _rxStream : _txStream;
+        if (streamSlot != nullptr)
+            throw std::runtime_error(direction == SOAPY_SDR_RX
+                                         ? "one RX stream is already open"
+                                         : "one TX stream is already open");
         auto state = std::make_unique<StreamState>();
+        state->direction = direction;
         state->format = format;
+        if (direction == SOAPY_SDR_TX) {
+            streamSlot = state.release();
+            return reinterpret_cast<SoapySDR::Stream *>(streamSlot);
+        }
         if (_usb != nullptr) {
             state->usb = _usb;
-            _stream = state.release();
-            return reinterpret_cast<SoapySDR::Stream *>(_stream);
+            streamSlot = state.release();
+            return reinterpret_cast<SoapySDR::Stream *>(streamSlot);
         }
         state->socketFd = ::socket(AF_INET, SOCK_DGRAM, 0);
         if (state->socketFd < 0) throw std::runtime_error("failed to create UDP socket");
+        try {
+            bindSocketToInterface(state->socketFd, _interface);
+        } catch (...) {
+            ::close(state->socketFd);
+            throw;
+        }
         int reuse = 1;
         setsockopt(state->socketFd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
         int requestedBuffer = static_cast<int>(_rxBufferBytes);
@@ -982,23 +1320,26 @@ public:
             throw std::runtime_error("failed to query UDP receiver port");
         }
         state->port = ntohs(address.sin_port);
-        _stream = state.release();
-        return reinterpret_cast<SoapySDR::Stream *>(_stream);
+        streamSlot = state.release();
+        return reinterpret_cast<SoapySDR::Stream *>(streamSlot);
     }
     void closeStream(SoapySDR::Stream *stream) override
     {
         auto *state = checkedStream(stream);
         if (state->active) deactivateStream(stream, 0, 0);
         if (state->socketFd >= 0) ::close(state->socketFd);
+        StreamState *&streamSlot = state->direction == SOAPY_SDR_RX
+                                       ? _rxStream : _txStream;
+        streamSlot = nullptr;
         delete state;
-        _stream = nullptr;
     }
     std::size_t getStreamMTU(SoapySDR::Stream *stream) const override
     {
-        (void)checkedStream(stream);
-        /* IQR8 carries 4096 real samples and produces 2048 complex samples
-         * on both transports. Advertising that full host-DSP block also
-         * remains valid when talking to older IQC1 USB firmware. */
+        const auto *state = checkedStream(stream);
+        if (state->direction == SOAPY_SDR_TX) return TX_REPLAY_MAX_SAMPLES;
+        /* Host reads can aggregate multiple native IQC8 frames, so retain the
+         * established 2048-complex-sample block as the public MTU on either
+         * transport. */
         return MAX_BLOCK_SAMPLES;
     }
     int activateStream(SoapySDR::Stream *stream, const int flags, const long long, const std::size_t numElems) override
@@ -1006,18 +1347,45 @@ public:
         auto *state = checkedStream(stream);
         if (flags != 0 || numElems != 0) return SOAPY_SDR_NOT_SUPPORTED;
         if (state->active) return 0;
+        const StreamState *opposite = state->direction == SOAPY_SDR_RX
+                                          ? _txStream : _rxStream;
+        if (opposite != nullptr && opposite->active.load()) {
+            SoapySDR::logf(SOAPY_SDR_ERROR,
+                           "ESP-SDR is half-duplex; deactivate %s before activating %s",
+                           state->direction == SOAPY_SDR_RX ? "TX" : "RX",
+                           state->direction == SOAPY_SDR_RX ? "RX" : "TX");
+            return SOAPY_SDR_STREAM_ERROR;
+        }
+        if (state->direction == SOAPY_SDR_TX) {
+            Json::Value patch;
+            patch["tx"]["tx_tone_enable"] = 0;
+            applyPatch(patch);
+            {
+                std::scoped_lock lock(state->mutex, state->txWriteMutex);
+                state->txBurstStatuses.clear();
+                state->txPendingWords.clear();
+                state->txPendingWords.reserve(TX_REPLAY_MAX_SAMPLES);
+                state->txBufferedSamples = 0;
+                state->txPendingHasTime = false;
+                state->txPendingStartTimeNs = 0;
+                state->txPendingActualTimeNs = 0;
+            }
+            state->active = true;
+            return 0;
+        }
         Json::Value patch;
         patch["stream"]["output_mode"] = 0;
         patch["stream"]["stream_wifi_packets"] = 0;
         patch["trigger"]["trigger_mode"] = 0;
-        patch["iq_engine"]["adc_decimation"] = state->usb == nullptr ? 1 : 2;
-        patch["rx_filter"]["rx_filter_override"] = state->usb == nullptr ? 62 : 0;
+        patch["rx_filter"]["rx_filter_override"] = 62;
         const unsigned total = _cycleTotal.load();
         const unsigned streamed = _cycleStream.load();
         patch["trigger"]["trigger_config"] = intervalTrigger(total, streamed);
         applyPatch(patch);
         state->cycleTotal = total;
         state->cycleStream = streamed;
+        const uint64_t timestampReferenceUs = hasHardwareTime()
+            ? static_cast<uint64_t>(getHardwareTime() / 1000) : 0u;
         {
             std::lock_guard<std::mutex> lock(state->mutex);
             state->queue.clear();
@@ -1025,25 +1393,48 @@ public:
             state->pending.clear();
             state->overflowPending = false;
             state->haveEpoch = false;
+            state->haveDatagramSequence = false;
+            state->missingDatagramSequences.clear();
+            state->unrecoveredDatagramGaps = 0;
             state->haveExpectedSource = false;
+            state->timestampUnwrapper.reset(timestampReferenceUs);
             state->haveFirmwareDropped = false;
             state->haveMinimumFrameSequence = false;
+            state->haveRxTelemetry = false;
             resetRealDsp(state);
+        }
+        if (state->usb != nullptr) {
+            /* Flush any endpoint data left by a crashed or bandwidth-starved
+             * previous client before submitting this session's IN transfers.
+             * The firmware resets the stream endpoint as part of STOP. */
+            _control->post("/api/v1/stream/stop",
+                           Json::Value(Json::objectValue));
         }
         state->stop = false;
         state->active = true;
-        state->worker = std::thread(state->usb != nullptr ? &EspDevice::usbReceiveLoop
-                                                          : &EspDevice::receiveLoop, state);
+        if (state->usb != nullptr) {
+            state->worker = std::thread(&EspDevice::usbReceiveLoop, state);
+        } else {
+            state->rxDatagramRing.resize(RX_DATAGRAM_RING_SIZE);
+            state->rxDatagramHead = 0;
+            state->rxDatagramTail = 0;
+            state->decoderWorker =
+                std::thread(&EspDevice::decodeLoop, state);
+            state->worker = std::thread(&EspDevice::receiveLoop, state);
+        }
         Json::Value body;
         body["port"] = state->port;
-        // Current Ethernet and USB firmware emit IQR8; the requested value
-        // remains compatible with older USB firmware that emitted IQC1.
-        body["stream_format"] = state->usb == nullptr ? 1 : 0;
+        // The combined S31 image emits native packed IQC8 on both high-speed
+        // transports. Request the compact native-IQ framing explicitly.
+        body["stream_format"] = 1;
         try {
             _control->post("/api/v1/stream/start", body);
         } catch (...) {
             state->stop = true;
+            state->rxWakeCondition.notify_all();
             if (state->worker.joinable()) state->worker.join();
+            if (state->decoderWorker.joinable())
+                state->decoderWorker.join();
             state->active = false;
             throw;
         }
@@ -1054,10 +1445,48 @@ public:
         auto *state = checkedStream(stream);
         if (flags != 0) return SOAPY_SDR_NOT_SUPPORTED;
         if (!state->active) return 0;
+        if (state->direction == SOAPY_SDR_TX) {
+            int result = 0;
+            {
+                std::lock_guard<std::mutex> lock(state->txWriteMutex);
+                if (!state->txPendingWords.empty()) {
+                    try {
+                        state->txPendingActualTimeNs = transmitTxWords(
+                            state->txPendingWords, 10'000'000,
+                            state->txPendingHasTime
+                                ? state->txPendingStartTimeNs : 0);
+                    } catch (const std::exception &error) {
+                        SoapySDR::logf(
+                            SOAPY_SDR_ERROR,
+                            "TX deactivation flush failed: %s", error.what());
+                        result = SOAPY_SDR_STREAM_ERROR;
+                    }
+                    state->txPendingWords.clear();
+                    state->txBufferedSamples = 0;
+                    state->txPendingHasTime = false;
+                    state->txPendingStartTimeNs = 0;
+                    state->txPendingActualTimeNs = 0;
+                }
+            }
+            Json::Value patch;
+            patch["tx"]["tx_tone_enable"] = 0;
+            try {
+                applyPatch(patch);
+            } catch (const std::exception &error) {
+                SoapySDR::logf(SOAPY_SDR_ERROR,
+                               "TX deactivation failed: %s", error.what());
+                result = SOAPY_SDR_STREAM_ERROR;
+            }
+            state->active = false;
+            state->condition.notify_all();
+            return result;
+        }
         try { _control->post("/api/v1/stream/stop", Json::Value(Json::objectValue)); }
         catch (const std::exception &error) { SoapySDR::logf(SOAPY_SDR_WARNING, "stream stop failed: %s", error.what()); }
         state->stop = true;
+        state->rxWakeCondition.notify_all();
         if (state->worker.joinable()) state->worker.join();
+        if (state->decoderWorker.joinable()) state->decoderWorker.join();
         state->active = false;
         state->condition.notify_all();
         return 0;
@@ -1068,6 +1497,7 @@ public:
         auto *state = checkedStream(stream);
         flags = 0;
         timeNs = 0;
+        if (state->direction != SOAPY_SDR_RX) return SOAPY_SDR_NOT_SUPPORTED;
         if (!state->active) {
             if (timeoutUs > 0) std::this_thread::sleep_for(std::chrono::microseconds(timeoutUs));
             return SOAPY_SDR_TIMEOUT;
@@ -1080,49 +1510,366 @@ public:
             return SOAPY_SDR_OVERFLOW;
         }
         if (state->queue.empty()) return SOAPY_SDR_TIMEOUT;
+        const SampleBlock &firstBlock = state->queue.front();
+        if (firstBlock.hasTime && firstBlock.sampleRateHz != 0) {
+            flags |= SOAPY_SDR_HAS_TIME;
+            timeNs = static_cast<long long>(firstBlock.timeNs) +
+                static_cast<long long>(std::llround(
+                    static_cast<long double>(firstBlock.offset) * 1.0e9L /
+                    firstBlock.sampleRateHz));
+        }
         std::size_t produced = 0;
+        uint64_t expectedNextTimeNs = 0;
+        bool haveExpectedNextTime = false;
+        auto timestampIsContiguous = [&](const SampleBlock &block) {
+            if (!haveExpectedNextTime || !block.hasTime) return true;
+            const uint64_t difference = block.timeNs > expectedNextTimeNs
+                ? block.timeNs - expectedNextTimeNs
+                : expectedNextTimeNs - block.timeNs;
+            return difference <= 2000u;
+        };
+        auto rememberBlockEnd = [&](const SampleBlock &block) {
+            if (!block.hasTime || block.sampleRateHz == 0u) {
+                haveExpectedNextTime = false;
+                return;
+            }
+            expectedNextTimeNs = block.timeNs +
+                static_cast<uint64_t>(std::llround(
+                    static_cast<long double>(block.samples) * 1.0e9L /
+                    block.sampleRateHz));
+            haveExpectedNextTime = true;
+        };
+        if (state->format != SOAPY_SDR_CS16) {
+            /* CS8/CF32 conversion touches every component. Copy one native
+             * block under the queue lock, then convert after releasing it so
+             * the 16 MSa/s decoder can enqueue the next frame concurrently.
+             * Holding this mutex across scalar conversion can back-pressure
+             * the decoder long enough to overflow the datagram SPSC ring. */
+            std::array<int16_t, MAX_BLOCK_SAMPLES * 2> native{};
+            lock.unlock();
+            while (produced < numElems) {
+                lock.lock();
+                if (state->queue.empty()) {
+                    lock.unlock();
+                    break;
+                }
+                SampleBlock &block = state->queue.front();
+                if (!timestampIsContiguous(block)) {
+                    lock.unlock();
+                    break;
+                }
+                const std::size_t count = std::min(
+                    {numElems - produced, block.samples - block.offset,
+                     MAX_BLOCK_SAMPLES});
+                std::memcpy(native.data(), block.iq.data() + block.offset * 2,
+                            count * 2 * sizeof(int16_t));
+                block.offset += count;
+                if (block.offset == block.samples) {
+                    rememberBlockEnd(block);
+                    state->queue.pop_front();
+                }
+                lock.unlock();
+                if (state->format == SOAPY_SDR_CS8) {
+                    auto *output = static_cast<int8_t *>(buffers[0]);
+                    for (std::size_t i = 0; i < count * 2; ++i)
+                        output[produced * 2 + i] = int8_t(native[i] / 4);
+                } else {
+                    auto *output = static_cast<float *>(buffers[0]);
+                    for (std::size_t i = 0; i < count * 2; ++i)
+                        output[produced * 2 + i] = native[i] / 512.0f;
+                }
+                produced += count;
+            }
+            return static_cast<int>(produced);
+        }
         while (produced < numElems && !state->queue.empty()) {
             SampleBlock &block = state->queue.front();
+            if (!timestampIsContiguous(block)) break;
             const std::size_t count = std::min(numElems - produced,
                                                block.samples - block.offset);
-            if (state->format == SOAPY_SDR_CS16) {
-                auto *output = static_cast<int16_t *>(buffers[0]);
-                std::memcpy(output + produced * 2, block.iq.data() + block.offset * 2, count * 2 * sizeof(int16_t));
-            } else if (state->format == SOAPY_SDR_CS8) {
-                auto *output = static_cast<int8_t *>(buffers[0]);
-                for (std::size_t i = 0; i < count * 2; ++i) output[produced * 2 + i] = int8_t(block.iq[block.offset * 2 + i] / 4);
-            } else {
-                auto *output = static_cast<float *>(buffers[0]);
-                for (std::size_t i = 0; i < count * 2; ++i) output[produced * 2 + i] = block.iq[block.offset * 2 + i] / 512.0f;
-            }
+            auto *output = static_cast<int16_t *>(buffers[0]);
+            std::memcpy(output + produced * 2,
+                        block.iq.data() + block.offset * 2,
+                        count * 2 * sizeof(int16_t));
             produced += count;
             block.offset += count;
-            if (block.offset == block.samples) state->queue.pop_front();
+            if (block.offset == block.samples) {
+                rememberBlockEnd(block);
+                state->queue.pop_front();
+            }
         }
         return static_cast<int>(produced);
     }
 
+    int writeStream(SoapySDR::Stream *stream, const void *const *buffers,
+                    const std::size_t numElems, int &flags,
+                    const long long timeNs,
+                    const long timeoutUs) override
+    {
+        auto *state = checkedStream(stream);
+        if (state->direction != SOAPY_SDR_TX || !state->active)
+            return SOAPY_SDR_STREAM_ERROR;
+        if ((flags & ~(SOAPY_SDR_END_BURST | SOAPY_SDR_ONE_PACKET |
+                       SOAPY_SDR_HAS_TIME)) != 0)
+            return SOAPY_SDR_NOT_SUPPORTED;
+        if (numElems != 0 && (buffers == nullptr || buffers[0] == nullptr))
+            return SOAPY_SDR_STREAM_ERROR;
+        if (numElems == 0 &&
+            (flags & (SOAPY_SDR_END_BURST | SOAPY_SDR_ONE_PACKET)) == 0)
+            return 0;
+        const bool endBurst = (flags & SOAPY_SDR_END_BURST) != 0;
+        const bool hasTime = (flags & SOAPY_SDR_HAS_TIME) != 0;
+        const bool flushRequested =
+            (flags & (SOAPY_SDR_END_BURST | SOAPY_SDR_ONE_PACKET)) != 0;
+        std::lock_guard<std::mutex> writeLock(state->txWriteMutex);
+        if (hasTime && (timeNs < 0 || !state->txPendingWords.empty() ||
+                        timeNs <= getHardwareTime())) {
+            return SOAPY_SDR_TIME_ERROR;
+        }
+        if (!hasTime && flushRequested && state->txPendingHasTime &&
+            state->txPendingStartTimeNs <= getHardwareTime()) {
+            /* A fragmented application may miss its deadline before sending
+             * END_BURST. Discard the unsent batch so deactivation cannot
+             * radiate it later as a surprising late transmission. */
+            state->txPendingWords.clear();
+            state->txBufferedSamples = 0;
+            state->txPendingHasTime = false;
+            state->txPendingStartTimeNs = 0;
+            return SOAPY_SDR_TIME_ERROR;
+        }
+        const std::size_t available =
+            TX_REPLAY_MAX_SAMPLES - state->txPendingWords.size();
+        const std::size_t count = std::min(numElems, available);
+        bool completedHasTime = false;
+        long long completedActualTimeNs = 0;
+        try {
+            if (hasTime) {
+                state->txPendingHasTime = true;
+                state->txPendingStartTimeNs = timeNs;
+            }
+            for (std::size_t i = 0; i < count; ++i) {
+                int32_t iv = 0;
+                int32_t qv = 0;
+                if (state->format == SOAPY_SDR_CS16) {
+                    const auto *samples =
+                        static_cast<const int16_t *>(buffers[0]);
+                    iv = static_cast<int32_t>(
+                        std::lround(samples[i * 2] / 64.0));
+                    qv = static_cast<int32_t>(
+                        std::lround(samples[i * 2 + 1] / 64.0));
+                } else if (state->format == SOAPY_SDR_CS8) {
+                    const auto *samples =
+                        static_cast<const int8_t *>(buffers[0]);
+                    iv = static_cast<int32_t>(samples[i * 2]) * 4;
+                    qv = static_cast<int32_t>(samples[i * 2 + 1]) * 4;
+                } else {
+                    const auto *samples =
+                        static_cast<const float *>(buffers[0]);
+                    iv = static_cast<int32_t>(
+                        std::lround(samples[i * 2] * 511.0f));
+                    qv = static_cast<int32_t>(
+                        std::lround(samples[i * 2 + 1] * 511.0f));
+                }
+                iv = std::clamp(iv, -512, 511);
+                qv = std::clamp(qv, -512, 511);
+                state->txPendingWords.push_back(
+                    (static_cast<uint32_t>(iv) & 0x3ffu) |
+                    ((static_cast<uint32_t>(qv) & 0x3ffu) << 10));
+                if (state->txPendingWords.size() == TX_REPLAY_MAX_SAMPLES) {
+                    completedHasTime = state->txPendingHasTime;
+                    completedActualTimeNs = transmitTxWords(
+                        state->txPendingWords, timeoutUs,
+                        state->txPendingHasTime
+                            ? state->txPendingStartTimeNs : 0);
+                    state->txPendingWords.clear();
+                    state->txBufferedSamples = 0;
+                    state->txPendingHasTime = false;
+                    state->txPendingStartTimeNs = 0;
+                }
+            }
+            if (flushRequested && !state->txPendingWords.empty()) {
+                completedHasTime = state->txPendingHasTime;
+                completedActualTimeNs = transmitTxWords(
+                    state->txPendingWords, timeoutUs,
+                    state->txPendingHasTime
+                        ? state->txPendingStartTimeNs : 0);
+                state->txPendingWords.clear();
+                state->txPendingHasTime = false;
+                state->txPendingStartTimeNs = 0;
+            }
+            state->txBufferedSamples = static_cast<uint32_t>(
+                state->txPendingWords.size());
+        } catch (const TimedTxError &error) {
+            /* Firmware is authoritative because a deadline can pass after
+             * host validation while a large waveform is still uploading. */
+            state->txPendingWords.clear();
+            state->txBufferedSamples = 0;
+            state->txPendingHasTime = false;
+            state->txPendingStartTimeNs = 0;
+            SoapySDR::logf(SOAPY_SDR_WARNING, "TX deadline missed: %s",
+                           error.what());
+            return SOAPY_SDR_TIME_ERROR;
+        } catch (const std::exception &error) {
+            state->txBufferedSamples = static_cast<uint32_t>(
+                state->txPendingWords.size());
+            SoapySDR::logf(SOAPY_SDR_ERROR, "TX write failed: %s", error.what());
+            return SOAPY_SDR_STREAM_ERROR;
+        }
+        if (endBurst) {
+            {
+                std::lock_guard<std::mutex> lock(state->mutex);
+                state->txBurstStatuses.emplace_back(
+                    completedHasTime, completedActualTimeNs);
+            }
+            state->condition.notify_all();
+        }
+        flags &= SOAPY_SDR_END_BURST;
+        return static_cast<int>(count);
+    }
+
+    int readStreamStatus(SoapySDR::Stream *stream, std::size_t &chanMask,
+                         int &flags, long long &timeNs,
+                         const long timeoutUs) override
+    {
+        auto *state = checkedStream(stream);
+        if (state->direction != SOAPY_SDR_TX)
+            return SOAPY_SDR_NOT_SUPPORTED;
+        std::unique_lock<std::mutex> lock(state->mutex);
+        const auto ready = [&]() {
+            return !state->txBurstStatuses.empty() || !state->active;
+        };
+        if (!state->condition.wait_for(
+                lock,
+                std::chrono::microseconds(std::max<long>(timeoutUs, 0)),
+                ready)) {
+            return SOAPY_SDR_TIMEOUT;
+        }
+        if (state->txBurstStatuses.empty())
+            return SOAPY_SDR_TIMEOUT;
+        const auto status = state->txBurstStatuses.front();
+        state->txBurstStatuses.pop_front();
+        chanMask = 1u;
+        flags = SOAPY_SDR_END_BURST |
+                (status.first ? SOAPY_SDR_HAS_TIME : 0);
+        timeNs = status.first ? status.second : 0;
+        return 0;
+    }
+
     std::vector<std::string> listSensors() const override
     {
-        return {"datagrams", "invalid_datagrams", "completed_frames", "lost_chunks",
+        return {"datagrams", "invalid_datagrams", "duplicate_datagrams",
+                "reordered_datagrams", "datagram_gaps",
+                "late_datagrams_recovered", "unrecovered_datagram_gaps",
+                "completed_frames", "lost_chunks",
                 "firmware_drops", "queue_drops", "capture_restarts",
+                "rx_agc_active", "rx_agc_current_gain",
+                "rx_agc_robust_peak", "rx_agc_gain_changes",
                 "timing_skew_sign", "timing_skew_ppm", "timing_odd_gain_ppm",
-                "adc_dump_cfg", "adc_dump_mode"};
+                "adc_dump_cfg", "adc_dump_mode", "tx_replay_words",
+                "tx_replay_segments", "tx_replay_total_cycles",
+                "tx_replay_sample_cycles", "tx_replay_gap_cycles",
+                "tx_replay_maximum_gap_cycles", "tx_replay_duty_ppm",
+                "tx_replay_requested_start_time_ns",
+                "tx_replay_actual_start_time_ns",
+                "tx_replay_start_error_ns",
+                "tx_replay_deadline_missed",
+                "tx_buffered_samples", "tx_udp_errors", "usb_tx_errors",
+                "usb_tx_uploads"};
     }
     SoapySDR::ArgInfo getSensorInfo(const std::string &key) const override
     {
         const auto sensors = listSensors();
         if (std::find(sensors.begin(), sensors.end(), key) == sensors.end()) throw std::runtime_error("unknown sensor: " + key);
         SoapySDR::ArgInfo info;
-        info.key = key; info.name = key; info.value = "0"; info.type = SoapySDR::ArgInfo::INT;
+        info.key = key;
+        info.name = key;
+        if (key == "tx_replay_deadline_missed" || key == "rx_agc_active") {
+            info.value = "false";
+            info.type = SoapySDR::ArgInfo::BOOL;
+        } else {
+            info.value = "0";
+            info.type = SoapySDR::ArgInfo::INT;
+        }
+        if (key == "rx_agc_current_gain") {
+            info.name = "AGC current RX gain";
+            info.description = "Current calibrated receive-gain-table entry";
+            info.units = "dB";
+        } else if (key == "rx_agc_robust_peak") {
+            info.name = "AGC robust peak";
+            info.description = "Most recent robust absolute IQ peak used by software AGC";
+            info.units = "counts";
+        } else if (key == "rx_agc_gain_changes") {
+            info.name = "AGC gain changes";
+            info.description = "Gain-table changes since the current AGC session started";
+            info.units = "changes";
+        } else if (key == "rx_agc_active") {
+            info.name = "Software AGC active";
+            info.description = "True while firmware software AGC controls receive gain";
+        }
         return info;
     }
     std::string readSensor(const std::string &key) const override
     {
-        const StreamState *state = _stream;
+        if (key == "tx_buffered_samples") {
+            return std::to_string(
+                _txStream == nullptr ? 0 : _txStream->txBufferedSamples.load());
+        }
+        if (key == "tx_udp_errors" || key == "usb_tx_errors" ||
+            key == "usb_tx_uploads") {
+            const Json::Value status = statusSnapshot();
+            return std::to_string(status.get(key, 0).asUInt());
+        }
+        if (key.rfind("rx_agc_", 0) == 0) {
+            const StreamState *rx = _rxStream;
+            if (rx != nullptr && rx->haveRxTelemetry.load()) {
+                if (key == "rx_agc_active")
+                    return rx->rxSoftwareAgcActive.load() ? "true" : "false";
+                if (key == "rx_agc_current_gain")
+                    return std::to_string(rx->rxGain.load());
+                if (key == "rx_agc_robust_peak")
+                    return std::to_string(rx->rxAgcRobustPeak.load());
+                if (key == "rx_agc_gain_changes")
+                    return std::to_string(rx->rxAgcGainChanges.load());
+            }
+            const Json::Value status = statusSnapshot();
+            const Json::Value agc = status["software_agc"];
+            if (key == "rx_agc_active")
+                return agc.get("active", false).asBool() ? "true" : "false";
+            if (key == "rx_agc_current_gain")
+                return std::to_string(agc.get("current_gain", 0).asUInt());
+            if (key == "rx_agc_robust_peak")
+                return std::to_string(agc.get("last_robust_peak", 0).asUInt());
+            if (key == "rx_agc_gain_changes")
+                return std::to_string(agc.get("gain_changes", 0).asUInt());
+        }
+        if (key.rfind("tx_replay_", 0) == 0) {
+            const Json::Value status = statusSnapshot();
+            const Json::Value replay = status["tx_replay"];
+            if (key == "tx_replay_words") return std::to_string(replay.get("words", 0).asUInt());
+            if (key == "tx_replay_segments") return std::to_string(replay.get("segments", 0).asUInt());
+            if (key == "tx_replay_total_cycles") return std::to_string(replay.get("total_cycles", 0).asUInt());
+            if (key == "tx_replay_sample_cycles") return std::to_string(replay.get("sample_cycles", 0).asUInt());
+            if (key == "tx_replay_gap_cycles") return std::to_string(replay.get("gap_cycles", 0).asUInt());
+            if (key == "tx_replay_maximum_gap_cycles") return std::to_string(replay.get("maximum_gap_cycles", 0).asUInt());
+            if (key == "tx_replay_requested_start_time_ns") return std::to_string(replay.get("requested_start_time_ns", Json::Int64(0)).asInt64());
+            if (key == "tx_replay_actual_start_time_ns") return std::to_string(replay.get("actual_start_time_ns", Json::Int64(0)).asInt64());
+            if (key == "tx_replay_start_error_ns") return std::to_string(replay.get("start_error_ns", Json::Int64(0)).asInt64());
+            if (key == "tx_replay_deadline_missed") return replay.get("deadline_missed", false).asBool() ? "true" : "false";
+            if (key == "tx_replay_duty_ppm") {
+                const uint64_t total = replay.get("total_cycles", 0).asUInt64();
+                const uint64_t samples = replay.get("sample_cycles", 0).asUInt64();
+                return std::to_string(total == 0 ? 0 : samples * 1'000'000 / total);
+            }
+        }
+        const StreamState *state = _rxStream != nullptr ? _rxStream : _txStream;
         if (state == nullptr) return "0";
         if (key == "datagrams") return std::to_string(state->datagrams.load());
         if (key == "invalid_datagrams") return std::to_string(state->invalidDatagrams.load());
+        if (key == "duplicate_datagrams") return std::to_string(state->duplicateDatagrams.load());
+        if (key == "reordered_datagrams") return std::to_string(state->reorderedDatagrams.load());
+        if (key == "datagram_gaps") return std::to_string(state->datagramGaps.load());
+        if (key == "late_datagrams_recovered") return std::to_string(state->lateDatagramsRecovered.load());
+        if (key == "unrecovered_datagram_gaps") return std::to_string(state->unrecoveredDatagramGaps.load());
         if (key == "completed_frames") return std::to_string(state->completedFrames.load());
         if (key == "lost_chunks") return std::to_string(state->lostChunks.load());
         if (key == "firmware_drops") return std::to_string(state->firmwareDrops.load());
@@ -1132,13 +1879,58 @@ public:
         if (key == "timing_skew_ppm") return std::to_string(state->timingSkewPpm.load());
         if (key == "timing_odd_gain_ppm") return std::to_string(state->timingOddGainPpm.load());
         if (key == "adc_dump_cfg" || key == "adc_dump_mode") {
-            const Json::Value status = _control->get("/api/v1/status");
+            const Json::Value status = statusSnapshot();
             return std::to_string(status[key].asUInt());
         }
         throw std::runtime_error("unknown sensor: " + key);
     }
 
 private:
+    void cacheStatus(const Json::Value &fresh) const
+    {
+        std::lock_guard<std::mutex> lock(_statusMutex);
+        _status = fresh;
+        _statusRefreshNs = monotonicNanoseconds();
+        if (fresh.isMember("hardware_time_ns")) {
+            _hardwareTimeAnchorNs = fresh["hardware_time_ns"].asInt64();
+            _hardwareTimeHostAnchorNs = _statusRefreshNs;
+            _haveHardwareTime = true;
+        }
+    }
+
+    Json::Value statusSnapshot() const
+    {
+        const int64_t now = monotonicNanoseconds();
+        {
+            std::lock_guard<std::mutex> lock(_statusMutex);
+            /* Full-rate IQ leaves deliberately little GMAC headroom for TCP.
+             * Firmware-backed diagnostics are secondary to a lossless sample
+             * stream, so retain the last safe snapshot until RX is stopped. */
+            if ((_rxStream != nullptr && _rxStream->active.load()) ||
+                (now - _statusRefreshNs) < 100'000'000ll) {
+                return _status;
+            }
+        }
+        try {
+            Json::Value fresh;
+            {
+                std::lock_guard<std::mutex> lock(_controlMutex);
+                fresh = _control->get("/api/v1/status");
+            }
+            cacheStatus(fresh);
+            return fresh;
+        } catch (const std::exception &error) {
+            std::lock_guard<std::mutex> lock(_statusMutex);
+            if (_status.isObject()) {
+                SoapySDR::logf(SOAPY_SDR_DEBUG,
+                               "using cached ESP-SDR status: %s",
+                               error.what());
+                return _status;
+            }
+            throw;
+        }
+    }
+
     static std::string valueOr(const SoapySDR::Kwargs &args, const std::string &key, const std::string &fallback)
     {
         const auto it = args.find(key);
@@ -1161,9 +1953,337 @@ private:
             throw std::runtime_error(std::string(name) + " is out of range");
         return value;
     }
-    static void checkRx(const int direction, const std::size_t channel)
+    void checkChannel(const int direction, const std::size_t channel) const
     {
-        if (direction != SOAPY_SDR_RX || channel != 0) throw std::runtime_error("SoapyESPSDR supports RX channel 0 only");
+        if (channel != 0 || (direction != SOAPY_SDR_RX && direction != SOAPY_SDR_TX))
+            throw std::runtime_error("SoapyESPSDR supports channel 0 only");
+    }
+    static const std::vector<double> &txSampleRates()
+    {
+        static const std::vector<double> rates{
+            80e6, 40e6, 80e6 / 3.0, 20e6, 8e6, 20e6 / 3.0,
+            4e6, 10e6 / 3.0,
+        };
+        return rates;
+    }
+    static const std::vector<double> &rxSampleRates()
+    {
+        static const std::vector<double> rates{
+            16e6, 8e6, 16e6 / 3.0, 4e6, 3.2e6,
+            16e6 / 6.0, 16e6 / 7.0, 2e6, 16e6 / 9.0, 1.6e6,
+        };
+        return rates;
+    }
+    static unsigned rxRateDivisor(const double rate)
+    {
+        for (unsigned divisor = 1; divisor <= 10; ++divisor) {
+            if (std::abs(rate - RX_BASE_SAMPLE_RATE / divisor) < 1000.0)
+                return divisor;
+        }
+        throw std::runtime_error(
+            "unsupported RX sample rate; use 16 MSa/s divided by an integer 1..10");
+    }
+    static unsigned txRateCode(const double rate)
+    {
+        static const std::array<std::pair<double, unsigned>, 8> rates{{
+            {80e6, 0}, {40e6, 1}, {80e6 / 3.0, 2}, {20e6, 3},
+            {8e6, 7}, {20e6 / 3.0, 8}, {4e6, 9}, {10e6 / 3.0, 10},
+        }};
+        for (const auto &entry : rates) {
+            if (std::abs(rate - entry.first) < 1000.0) return entry.second;
+        }
+        throw std::runtime_error("unsupported TX sample rate");
+    }
+    long long uploadTxWordsUsb(const std::vector<uint32_t> &words,
+                               const long timeoutUs,
+                               const long long startTimeNs)
+    {
+        std::lock_guard<std::mutex> controlLock(_controlMutex);
+        auto *usbControl = static_cast<UsbControl *>(_control.get());
+        const auto timeout = std::chrono::microseconds(
+            std::max<long>(timeoutUs, 10'000'000));
+        const auto deadline = std::chrono::steady_clock::now() + timeout;
+
+        std::array<uint8_t, 16> arm{};
+        putLe32(arm.data(), static_cast<uint32_t>(words.size()));
+        uint16_t commitFlags = 0;
+        if (_txUdpAutostart) {
+            commitFlags = TX_UDP_FLAG_AUTOSTART |
+                static_cast<uint16_t>(txRateCode(_txSampleRate)
+                                      << TX_UDP_RATE_CODE_SHIFT);
+        }
+        putLe16(arm.data() + 4, commitFlags);
+        putLe64(arm.data() + 8, static_cast<uint64_t>(startTimeNs));
+
+        bool armed = false;
+        try {
+            usbControl->rawRequest(USB_OP_TX_ARM, arm.data(), arm.size());
+            armed = true;
+            for (std::size_t offset = 0; offset < words.size();) {
+                const std::size_t count = std::min(
+                    USB_TX_TRANSFER_BYTES / sizeof(uint32_t),
+                    words.size() - offset);
+                std::vector<uint8_t> payload(count * sizeof(uint32_t));
+                for (std::size_t i = 0; i < count; ++i)
+                    putLe32(payload.data() + i * sizeof(uint32_t),
+                            words[offset + i]);
+
+                const int64_t remainingMs =
+                    std::chrono::duration_cast<std::chrono::milliseconds>(
+                        deadline - std::chrono::steady_clock::now()).count();
+                if (remainingMs <= 0)
+                    throw std::runtime_error("USB TX upload timed out");
+                const unsigned transferTimeout = static_cast<unsigned>(
+                    std::min<int64_t>(remainingMs, USB_CTRL_TIMEOUT_MS));
+                int transferred = 0;
+                const int status = libusb_bulk_transfer(
+                    _usb->handle, USB_EP_TX_OUT, payload.data(),
+                    static_cast<int>(payload.size()), &transferred,
+                    transferTimeout);
+                if (status != 0 ||
+                    transferred != static_cast<int>(payload.size())) {
+                    throw std::runtime_error(
+                        std::string("USB TX data write failed: ") +
+                        libusb_error_name(status));
+                }
+                offset += count;
+            }
+            usbControl->rawRequest(USB_OP_TX_COMMIT, nullptr, 0);
+            armed = false;
+
+            if (_txUdpAutostart) {
+                while (std::chrono::steady_clock::now() < deadline) {
+                    const Json::Value status =
+                        _control->get("/api/v1/status");
+                    cacheStatus(status);
+                    const Json::Value replay = status["tx_replay"];
+                    const long long requested = replay.get(
+                        "requested_start_time_ns", Json::Int64(0)).asInt64();
+                    if (!status.get("config_applying", false).asBool() &&
+                        (startTimeNs == 0 || requested == startTimeNs)) {
+                        const long long actual = replay.get(
+                            "actual_start_time_ns", Json::Int64(0)).asInt64();
+                        if (startTimeNs != 0 &&
+                            (actual == 0 || replay.get(
+                                "deadline_missed", false).asBool()))
+                            throw TimedTxError(
+                                "deadline passed during USB waveform staging");
+                        return actual;
+                    }
+                    std::this_thread::sleep_for(std::chrono::milliseconds(25));
+                }
+                throw std::runtime_error(
+                    "timed out waiting for USB TX replay completion");
+            }
+        } catch (...) {
+            if (armed) {
+                try {
+                    usbControl->rawRequest(USB_OP_TX_ABORT, nullptr, 0);
+                } catch (...) {
+                }
+            }
+            throw;
+        }
+        return 0;
+    }
+    long long uploadTxWords(const std::vector<uint32_t> &words,
+                            const long timeoutUs,
+                            const long long startTimeNs)
+    {
+        if (words.empty() || words.size() > TX_REPLAY_MAX_SAMPLES)
+            throw std::runtime_error("TX burst must contain 1.." +
+                                     std::to_string(TX_REPLAY_MAX_SAMPLES) +
+                                     " samples");
+        if (_usb != nullptr) {
+            return uploadTxWordsUsb(words, timeoutUs, startTimeNs);
+        }
+
+        std::lock_guard<std::mutex> controlLock(_controlMutex);
+        Json::Value armRequest(Json::objectValue);
+        if (startTimeNs != 0)
+            armRequest["start_time_ns"] = Json::Int64(startTimeNs);
+        const Json::Value arm = _control->post(
+            "/api/v1/tx/udp/arm", armRequest);
+        const uint32_t token = arm["session_token"].asUInt();
+        const unsigned port = arm.get("port", 50001).asUInt();
+        const uint32_t beforeCommits = arm.get("commit_count", 0).asUInt();
+        if (token == 0 || words.size() > arm.get("max_words", 0).asUInt64())
+            throw std::runtime_error("invalid TX UDP arm response");
+
+        addrinfo hints{};
+        hints.ai_family = AF_INET;
+        hints.ai_socktype = SOCK_DGRAM;
+        addrinfo *rawAddresses = nullptr;
+        const std::string service = std::to_string(port);
+        const int resolveResult = getaddrinfo(_host.c_str(), service.c_str(),
+                                              &hints, &rawAddresses);
+        if (resolveResult != 0)
+            throw std::runtime_error("cannot resolve ESP-SDR host: " +
+                                     std::string(gai_strerror(resolveResult)));
+        std::unique_ptr<addrinfo, decltype(&freeaddrinfo)> addresses(
+            rawAddresses, freeaddrinfo);
+
+        int socketFd = -1;
+        for (const addrinfo *address = addresses.get(); address != nullptr;
+             address = address->ai_next) {
+            socketFd = ::socket(address->ai_family, address->ai_socktype,
+                                address->ai_protocol);
+            if (socketFd < 0) continue;
+            try {
+                bindSocketToInterface(socketFd, _interface);
+            } catch (...) {
+                ::close(socketFd);
+                throw;
+            }
+            if (::connect(socketFd, address->ai_addr, address->ai_addrlen) == 0)
+                break;
+            ::close(socketFd);
+            socketFd = -1;
+        }
+        if (socketFd < 0) throw std::runtime_error("cannot connect TX UDP socket");
+        struct SocketCloser {
+            void operator()(int *fd) const { if (fd != nullptr) { ::close(*fd); delete fd; } }
+        };
+        std::unique_ptr<int, SocketCloser> socketGuard(new int(socketFd));
+        int sendBuffer = 1 << 20;
+        setsockopt(socketFd, SOL_SOCKET, SO_SNDBUF, &sendBuffer,
+                   sizeof(sendBuffer));
+
+        static std::atomic<uint32_t> nextBatch{1};
+        const uint32_t batch = nextBatch.fetch_add(1);
+        /* A first RX->TX transition includes control-plane serialization and
+         * RF/replay reconfiguration in addition to the UDP upload. Common
+         * SDR applications pass sub-second stream timeouts intended for FIFO
+         * waits; treating those as an end-to-end hardware deadline races the
+         * firmware and cancels otherwise valid bursts. Preserve a synchronous
+         * END_BURST contract with a conservative minimum, while honoring any
+         * longer timeout requested by the caller. */
+        const auto timeout = std::chrono::microseconds(
+            std::max<long>(timeoutUs, 10'000'000));
+        const auto deadline = std::chrono::steady_clock::now() + timeout;
+        std::size_t resumeOffset = 0;
+
+        auto receiveAck = [&](int waitMs, std::size_t &received) -> bool {
+            pollfd descriptor{socketFd, POLLIN, 0};
+            if (::poll(&descriptor, 1, waitMs) <= 0) return false;
+            std::array<uint8_t, TX_UDP_ACK_BYTES> ack{};
+            const ssize_t bytes = ::recv(socketFd, ack.data(), ack.size(), 0);
+            if (bytes != static_cast<ssize_t>(ack.size()) ||
+                std::memcmp(ack.data(), "IQA1", 4) != 0 ||
+                le16(ack.data() + 4) != 1 ||
+                le16(ack.data() + 6) != TX_UDP_ACK_BYTES ||
+                le32(ack.data() + 8) != token ||
+                le32(ack.data() + 12) != batch ||
+                le32(ack.data() + 36) !=
+                    static_cast<uint32_t>(crc32(0, ack.data(), 36))) return false;
+            received = le32(ack.data() + 20);
+            return le32(ack.data() + 24) == words.size() &&
+                   le32(ack.data() + 32) > beforeCommits;
+        };
+
+        bool recovery = false;
+        while (std::chrono::steady_clock::now() < deadline) {
+            const bool reset = resumeOffset == 0;
+            auto pacingDeadline = std::chrono::steady_clock::now();
+            for (std::size_t offset = resumeOffset; offset < words.size();
+                 offset += TX_UDP_WORDS_PER_DATAGRAM) {
+                const std::size_t count = std::min(
+                    TX_UDP_WORDS_PER_DATAGRAM, words.size() - offset);
+                const bool final = offset + count == words.size();
+                std::vector<uint8_t> packet(TX_UDP_HEADER_BYTES + count * 4);
+                std::memcpy(packet.data(), "IQT1", 4);
+                putLe16(packet.data() + 4, 1);
+                putLe16(packet.data() + 6, TX_UDP_HEADER_BYTES);
+                putLe32(packet.data() + 8, token);
+                putLe32(packet.data() + 12, batch);
+                putLe32(packet.data() + 16,
+                        static_cast<uint32_t>(offset / TX_UDP_WORDS_PER_DATAGRAM));
+                putLe32(packet.data() + 20, static_cast<uint32_t>(offset));
+                putLe16(packet.data() + 24, static_cast<uint16_t>(count));
+                uint16_t packetFlags = (reset && offset == 0 ? 1u : 0u) |
+                                       (final ? 2u | 4u : 0u);
+                if (final && _txUdpAutostart) {
+                    packetFlags |= TX_UDP_FLAG_AUTOSTART |
+                        static_cast<uint16_t>(txRateCode(_txSampleRate)
+                                              << TX_UDP_RATE_CODE_SHIFT);
+                }
+                putLe16(packet.data() + 26, packetFlags);
+                putLe32(packet.data() + 28, 0);
+                putLe32(packet.data() + 32,
+                        static_cast<uint32_t>(crc32(0, packet.data(), 32)));
+                uint8_t *payload = packet.data() + TX_UDP_HEADER_BYTES;
+                for (std::size_t i = 0; i < count; ++i)
+                    putLe32(payload + i * 4, words[offset + i]);
+                if (::send(socketFd, packet.data(), packet.size(), 0) !=
+                    static_cast<ssize_t>(packet.size()))
+                    throw std::runtime_error("TX UDP send failed");
+                pacingDeadline += std::chrono::microseconds(recovery ? 75 : 50);
+                std::this_thread::sleep_until(pacingDeadline);
+            }
+
+            std::size_t received = resumeOffset;
+            const int remainingMs = static_cast<int>(std::max<int64_t>(
+                1, std::chrono::duration_cast<std::chrono::milliseconds>(
+                       deadline - std::chrono::steady_clock::now()).count()));
+            if (receiveAck(std::min(remainingMs, 25), received)) {
+                if (_txUdpAutostart) {
+                    /* The commit ACK means ownership and the replay request
+                     * were accepted. Wait until the short queued replay has
+                     * completed so an immediate deactivate or next write
+                     * cannot overwrite that request. */
+                    while (std::chrono::steady_clock::now() < deadline) {
+                        const Json::Value status =
+                            _control->get("/api/v1/status");
+                        cacheStatus(status);
+                        const Json::Value replay = status["tx_replay"];
+                        const long long requested = replay.get(
+                            "requested_start_time_ns",
+                            Json::Int64(0)).asInt64();
+                        if (!status.get("config_applying", false).asBool() &&
+                            (startTimeNs == 0 || requested == startTimeNs)) {
+                            const long long actual = replay.get(
+                                "actual_start_time_ns", Json::Int64(0)).asInt64();
+                            if (startTimeNs != 0 &&
+                                (actual == 0 || replay.get(
+                                    "deadline_missed", false).asBool()))
+                                throw TimedTxError(
+                                    "deadline passed during Ethernet waveform staging");
+                            return actual;
+                        }
+                        std::this_thread::sleep_for(
+                            std::chrono::milliseconds(25));
+                    }
+                    throw std::runtime_error(
+                        "timed out waiting for TX replay completion");
+                }
+                return 0;
+            }
+            if (received < words.size() &&
+                received % TX_UDP_WORDS_PER_DATAGRAM == 0) {
+                resumeOffset = received;
+                recovery = true;
+            }
+        }
+        throw std::runtime_error("TX UDP commit timed out at " +
+                                 std::to_string(resumeOffset) + "/" +
+                                 std::to_string(words.size()) + " samples");
+    }
+    long long transmitTxWords(const std::vector<uint32_t> &words,
+                              const long timeoutUs,
+                              const long long startTimeNs)
+    {
+        const long long actualTimeNs =
+            uploadTxWords(words, timeoutUs, startTimeNs);
+        if (_txUdpAutostart) return actualTimeNs;
+        Json::Value start;
+        start["tx"]["tx_tone0_step"] =
+            (txRateCode(_txSampleRate) << 4) | 3u | (1u << 8);
+        start["tx"]["tx_tone_enable"] = 2;
+        applyPatch(start);
+        Json::Value stop;
+        stop["tx"]["tx_tone_enable"] = 0;
+        applyPatch(stop);
+        return 0;
     }
     void applyDutyCycle(unsigned total, unsigned streamed)
     {
@@ -1176,9 +2296,9 @@ private:
         applyPatch(patch);
         _cycleTotal = total;
         _cycleStream = streamed;
-        if (_stream != nullptr) {
-            _stream->cycleTotal = total;
-            _stream->cycleStream = streamed;
+        if (_rxStream != nullptr) {
+            _rxStream->cycleTotal = total;
+            _rxStream->cycleStream = streamed;
         }
     }
     static uint32_t nextSelectedSource(uint32_t source, unsigned total, unsigned streamed)
@@ -1199,7 +2319,8 @@ private:
     StreamState *checkedStream(SoapySDR::Stream *stream) const
     {
         auto *state = reinterpret_cast<StreamState *>(stream);
-        if (state == nullptr || state != _stream) throw std::runtime_error("invalid SoapyESPSDR stream");
+        if (state == nullptr || (state != _rxStream && state != _txStream))
+            throw std::runtime_error("invalid SoapyESPSDR stream");
         return state;
     }
     uint64_t configUInt64(const char *group, const char *key, uint64_t fallback) const
@@ -1221,7 +2342,7 @@ private:
     void applyPatch(const Json::Value &patch)
     {
         std::lock_guard<std::mutex> controlLock(_controlMutex);
-        StreamState *stream = _stream;
+        StreamState *stream = _rxStream;
         const bool active = stream != nullptr && stream->active.load();
         if (active) {
             stream->suppressContinuityUntilNs = monotonicNanoseconds() + 15'000'000'000ll;
@@ -1231,6 +2352,7 @@ private:
             const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
             while (std::chrono::steady_clock::now() < deadline) {
                 const Json::Value status = _control->get("/api/v1/status");
+                cacheStatus(status);
                 if (!status.get("config_applying", false).asBool()) {
                     Json::Value applied = _control->get("/api/v1/config");
                     if (jsonContains(applied, patch)) {
@@ -1273,16 +2395,19 @@ private:
         state->timingHistoryPosition = REAL_TIMING_TAPS - 1;
         state->timingSkewSign = 0;
         state->timingOffset.fill(0.0f);
-        /* The 4 MHz USB capture clock is synchronous with the ADC update
-         * cadence and needs no alternating fractional-delay correction. The
-         * 32 MHz Ethernet clock crosses the 80 MHz ADC cadence and retains
-         * the measured conservative correction until calibration refines it. */
+        /* Native USB IQ bypasses this real-IF reconstruction path. Keep its
+         * correction disabled; the 32 MHz Ethernet real-IF compatibility
+         * path retains the measured conservative correction. */
         state->timingCoefficientScale = state->usb != nullptr ? 0.0f : 1.0f;
         state->timingOddGain = 1.0f;
         state->timingSkewPpm = 0;
         state->timingOddGainPpm = 1'000'000;
         state->timingCalibration.clear();
         state->timingCalibration.reserve(REAL_TIMING_CALIBRATION_FRAMES);
+        state->timingCalibrationTimeNs.clear();
+        state->timingCalibrationTimeNs.reserve(REAL_TIMING_CALIBRATION_FRAMES);
+        state->timingCalibrationRateHz.clear();
+        state->timingCalibrationRateHz.reserve(REAL_TIMING_CALIBRATION_FRAMES);
     }
     static void calibrationFft(std::vector<std::complex<float>> &data)
     {
@@ -1630,18 +2755,40 @@ private:
             state->mixerPhase = (state->mixerPhase + 1) & 3u;
         }
     }
-    static void finishFrame(StreamState *state, const PendingFrame &pending)
+    static void finishIqFrame(StreamState *state, const uint8_t *frame,
+                              std::size_t frameBytes)
     {
-        const bool full = pending.data.size() == IQ_FRAME_BYTES && std::memcmp(pending.data.data(), "IQC1", 4) == 0;
-        const bool compressed = pending.data.size() == IQ8_FRAME_BYTES && std::memcmp(pending.data.data(), "IQC8", 4) == 0;
-        const bool real = pending.data.size() == REAL8_FRAME_BYTES && std::memcmp(pending.data.data(), "IQR8", 4) == 0;
-        if (!validFrame(pending) || (!full && !compressed && !real)) {
+        const bool full = frameBytes == IQ_FRAME_BYTES &&
+            std::memcmp(frame, "IQC1", 4) == 0;
+        const bool compressed = frameBytes == IQ8_FRAME_BYTES &&
+            std::memcmp(frame, "IQC8", 4) == 0;
+        const bool real = frameBytes == REAL8_FRAME_BYTES &&
+            std::memcmp(frame, "IQR8", 4) == 0;
+        const uint32_t wireCrc = frameBytes >= 4 ?
+            le32(frame + frameBytes - 4) : 0;
+        if ((!full && !compressed && !real) ||
+            (wireCrc != 0 &&
+             wireCrc != static_cast<uint32_t>(
+                 crc32(0, frame, frameBytes - 4)))) {
             state->invalidDatagrams++;
             return;
         }
-        const uint32_t source = le32(pending.data.data() + 8);
+        const uint32_t source = le32(frame + 8);
+        const uint32_t frameFlags = le32(frame + 32);
+        state->rxGain = le32(frame + 28);
+        state->rxSoftwareAgcActive =
+            (frameFlags & IQ_FLAG_SOFTWARE_AGC_ACTIVE) != 0u;
+        state->rxAgcRobustPeak =
+            (frameFlags >> IQ_AGC_ROBUST_PEAK_SHIFT) &
+            IQ_AGC_ROBUST_PEAK_MASK;
+        state->rxAgcGainChanges =
+            (frameFlags >> IQ_AGC_GAIN_CHANGES_SHIFT) &
+            IQ_AGC_GAIN_CHANGES_MASK;
+        state->haveRxTelemetry = true;
+        const uint32_t timestampUs32 = le32(frame + 12);
+        const uint32_t sampleRateHz = le32(frame + 20);
         SampleBlock block;
-        const uint8_t *sampleData = pending.data.data() + IQ_HEADER_BYTES;
+        const uint8_t *sampleData = frame + IQ_HEADER_BYTES;
         if (compressed) {
             // Interleaved int8 I,Q pairs holding the top 8 of 10 sample
             // bits; scale to the canonical 10-bit range.
@@ -1683,6 +2830,16 @@ private:
         }
         state->expectedSource = nextSelectedSource(source, total, streamed);
         state->haveExpectedSource = true;
+        if ((frameFlags & IQ_FLAG_TIMESTAMP_US32) != 0u &&
+            sampleRateHz != 0u) {
+            const auto extendedUs =
+                state->timestampUnwrapper.unwrap(timestampUs32);
+            if (extendedUs) {
+                block.timeNs = *extendedUs * 1000u;
+                block.sampleRateHz = sampleRateHz;
+                block.hasTime = true;
+            }
+        }
         auto enqueue = [state](SampleBlock &&ready) {
             if (state->queue.size() >= MAX_QUEUE_BLOCKS) {
                 state->queue.pop_front();
@@ -1695,18 +2852,28 @@ private:
             std::array<int8_t, REAL8_SAMPLES> raw{};
             std::memcpy(raw.data(), sampleData, raw.size());
             state->timingCalibration.emplace_back(std::move(raw));
+            state->timingCalibrationTimeNs.push_back(block.timeNs);
+            state->timingCalibrationRateHz.push_back(block.sampleRateHz);
             if (state->timingCalibration.size() ==
                 REAL_TIMING_CALIBRATION_FRAMES) {
                 state->timingSkewSign = detectTimingSkew(state);
-                for (const auto &calibration : state->timingCalibration) {
+                for (std::size_t index = 0;
+                     index < state->timingCalibration.size(); ++index) {
+                    const auto &calibration = state->timingCalibration[index];
                     SampleBlock corrected;
                     processRealFrame(
                         state,
                         reinterpret_cast<const uint8_t *>(calibration.data()),
                         corrected);
+                    corrected.timeNs = state->timingCalibrationTimeNs[index];
+                    corrected.sampleRateHz =
+                        state->timingCalibrationRateHz[index];
+                    corrected.hasTime = corrected.sampleRateHz != 0u;
                     enqueue(std::move(corrected));
                 }
                 state->timingCalibration.clear();
+                state->timingCalibrationTimeNs.clear();
+                state->timingCalibrationRateHz.clear();
             }
         } else {
             if (real) processRealFrame(state, sampleData, block);
@@ -1715,6 +2882,28 @@ private:
         state->completedFrames++;
         state->condition.notify_all();
     }
+    static void finishFrame(StreamState *state, const PendingFrame &pending)
+    {
+        if (std::memcmp(pending.first.frameMagic.data(), "IQB8", 4) == 0) {
+            if (pending.data.empty() ||
+                pending.data.size() % IQ8_FRAME_BYTES != 0 ||
+                pending.first.frameCrc != 0) {
+                state->invalidDatagrams++;
+                return;
+            }
+            for (std::size_t offset = 0; offset < pending.data.size();
+                 offset += IQ8_FRAME_BYTES) {
+                finishIqFrame(state, pending.data.data() + offset,
+                              IQ8_FRAME_BYTES);
+            }
+            return;
+        }
+        if (!validFrame(pending)) {
+            state->invalidDatagrams++;
+            return;
+        }
+        finishIqFrame(state, pending.data.data(), pending.data.size());
+    }
     static void handleDatagram(StreamState *state, const uint8_t *data, std::size_t bytes)
     {
         state->datagrams++;
@@ -1722,7 +2911,8 @@ private:
         if (!parseHeader(data, bytes, header)) { state->invalidDatagrams++; return; }
         if (std::memcmp(header.frameMagic.data(), "IQC1", 4) != 0 &&
             std::memcmp(header.frameMagic.data(), "IQC8", 4) != 0 &&
-            std::memcmp(header.frameMagic.data(), "IQR8", 4) != 0) return;
+            std::memcmp(header.frameMagic.data(), "IQR8", 4) != 0 &&
+            std::memcmp(header.frameMagic.data(), "IQB8", 4) != 0) return;
         if (!state->haveEpoch || state->epoch != header.epoch) {
             std::lock_guard<std::mutex> lock(state->mutex);
             state->epoch = header.epoch;
@@ -1733,25 +2923,81 @@ private:
             state->haveExpectedSource = false;
             state->haveFirmwareDropped = false;
             state->haveMinimumFrameSequence = false;
+            state->haveDatagramSequence = false;
+            state->missingDatagramSequences.clear();
+            state->unrecoveredDatagramGaps = 0;
             resetRealDsp(state);
         }
-        bool captureRestart = false;
-        {
-            std::lock_guard<std::mutex> lock(state->mutex);
-            const unsigned reorderWindow = std::max(8u, state->cycleTotal.load() * 2u);
-            if (state->haveExpectedSource && header.sourceChunk < state->expectedSource &&
-                state->expectedSource - header.sourceChunk > reorderWindow) {
-                state->queue.clear();
-                state->haveExpectedSource = false;
-                state->captureRestarts++;
-                resetRealDsp(state);
-                if (monotonicNanoseconds() >= state->suppressContinuityUntilNs.load()) {
-                    state->overflowPending = true;
-                }
-                state->minimumFrameSequence = header.frameSequence;
-                state->haveMinimumFrameSequence = true;
-                captureRestart = true;
+        const uint32_t sequence = header.datagramSequence;
+        if (state->haveDatagramSequence) {
+            if (sequence == state->lastDatagramSequence) {
+                state->duplicateDatagrams++;
+                return;
             }
+            const int32_t displacement = static_cast<int32_t>(
+                sequence - state->expectedDatagramSequence);
+            if (displacement < 0) {
+                auto missing = state->missingDatagramSequences.find(sequence);
+                if (missing != state->missingDatagramSequences.end()) {
+                    state->missingDatagramSequences.erase(missing);
+                    state->lateDatagramsRecovered++;
+                    state->unrecoveredDatagramGaps--;
+                    state->reorderedDatagrams++;
+                } else {
+                    // An old sequence which was not an observed hole is a
+                    // replayed datagram. Discard it before it can recreate a
+                    // frame that was already delivered.
+                    state->duplicateDatagrams++;
+                    return;
+                }
+            } else {
+                if (displacement > 0) {
+                    state->datagramGaps += static_cast<uint32_t>(displacement);
+                    state->unrecoveredDatagramGaps += static_cast<uint32_t>(displacement);
+                    // Retain exact sequence identities only for small gaps.
+                    // Large gaps are still counted but cannot consume
+                    // unbounded host memory during a broken link.
+                    if (displacement <= 4096) {
+                        for (uint32_t missing = state->expectedDatagramSequence;
+                             missing != sequence; ++missing) {
+                            state->missingDatagramSequences.insert(missing);
+                        }
+                        while (state->missingDatagramSequences.size() > 8192)
+                            state->missingDatagramSequences.erase(
+                                state->missingDatagramSequences.begin());
+                    }
+                }
+                state->expectedDatagramSequence = sequence + 1;
+            }
+        } else {
+            state->expectedDatagramSequence = sequence + 1;
+            state->haveDatagramSequence = true;
+        }
+        state->lastDatagramSequence = sequence;
+        bool captureRestart = false;
+        const unsigned reorderWindow =
+            std::max(8u, state->cycleTotal.load() * 2u);
+        /* expectedSource and the restart-generation fields are owned by this
+         * receive thread. Do not take the sample-queue mutex for every UDP
+         * fragment merely to inspect them: at 20 MSa/s that added roughly
+         * 40,000 unnecessary lock operations per second and kept the socket
+         * from draining NIC aggregation bursts. Only an actual restart needs
+         * the lock because it clears host-visible queued samples. */
+        if (state->haveExpectedSource &&
+            header.sourceChunk < state->expectedSource &&
+            state->expectedSource - header.sourceChunk > reorderWindow) {
+            std::lock_guard<std::mutex> lock(state->mutex);
+            state->queue.clear();
+            state->haveExpectedSource = false;
+            state->captureRestarts++;
+            resetRealDsp(state);
+            if (monotonicNanoseconds() >=
+                state->suppressContinuityUntilNs.load()) {
+                state->overflowPending = true;
+            }
+            state->minimumFrameSequence = header.frameSequence;
+            state->haveMinimumFrameSequence = true;
+            captureRestart = true;
         }
         if (captureRestart) {
             state->sequentialPendingActive = false;
@@ -1841,10 +3087,52 @@ private:
                                           BATCH, 0, nullptr);
             if (received <= 0) continue;
             for (int i = 0; i < received; ++i) {
-                handleDatagram(state, buffers[static_cast<unsigned>(i)].data(),
-                               messages[static_cast<unsigned>(i)].msg_len);
+                const uint32_t head =
+                    state->rxDatagramHead.load(std::memory_order_relaxed);
+                const uint32_t tail =
+                    state->rxDatagramTail.load(std::memory_order_acquire);
+                if (head - tail >= RX_DATAGRAM_RING_SIZE) {
+                    state->invalidDatagrams++;
+                    messages[static_cast<unsigned>(i)].msg_len = 0;
+                    continue;
+                }
+                RxDatagram &slot =
+                    state->rxDatagramRing[head % RX_DATAGRAM_RING_SIZE];
+                const std::size_t bytes =
+                    messages[static_cast<unsigned>(i)].msg_len;
+                std::memcpy(slot.data.data(),
+                            buffers[static_cast<unsigned>(i)].data(), bytes);
+                slot.bytes = static_cast<uint16_t>(bytes);
+                state->rxDatagramHead.store(head + 1,
+                                            std::memory_order_release);
                 messages[static_cast<unsigned>(i)].msg_len = 0;
             }
+            state->rxWakeCondition.notify_one();
+        }
+    }
+    static void decodeLoop(StreamState *state)
+    {
+        while (true) {
+            uint32_t tail =
+                state->rxDatagramTail.load(std::memory_order_relaxed);
+            const uint32_t head =
+                state->rxDatagramHead.load(std::memory_order_acquire);
+            if (tail != head) {
+                const RxDatagram &slot =
+                    state->rxDatagramRing[tail % RX_DATAGRAM_RING_SIZE];
+                handleDatagram(state, slot.data.data(), slot.bytes);
+                state->rxDatagramTail.store(tail + 1,
+                                            std::memory_order_release);
+                continue;
+            }
+            if (state->stop.load()) break;
+            std::unique_lock<std::mutex> lock(state->rxWakeMutex);
+            state->rxWakeCondition.wait_for(
+                lock, std::chrono::milliseconds(2), [state]() {
+                    return state->stop.load() ||
+                        state->rxDatagramTail.load(std::memory_order_relaxed) !=
+                        state->rxDatagramHead.load(std::memory_order_acquire);
+                });
         }
     }
 
@@ -1914,6 +3202,7 @@ private:
     }
 
     std::string _host;
+    std::string _interface;
     unsigned _httpPort;
     unsigned _requestedUdpPort;
     unsigned _rxBufferBytes;
@@ -1921,13 +3210,22 @@ private:
     std::atomic<unsigned> _cycleStream;
     std::shared_ptr<UsbContext> _usb;
     std::unique_ptr<Control> _control;
-    std::mutex _controlMutex;
+    mutable std::mutex _controlMutex;
     mutable std::mutex _configMutex;
+    mutable std::mutex _statusMutex;
     Json::Value _config;
+    mutable Json::Value _status;
+    mutable int64_t _statusRefreshNs = 0;
+    mutable int64_t _hardwareTimeAnchorNs = 0;
+    mutable int64_t _hardwareTimeHostAnchorNs = 0;
+    mutable bool _haveHardwareTime = false;
     double _gainMin = 0.0;
     double _gainMax = 76.0;
     double _gainStep = 1.0;
-    StreamState *_stream = nullptr;
+    double _txSampleRate = 20e6;
+    bool _txUdpAutostart = false;
+    StreamState *_rxStream = nullptr;
+    StreamState *_txStream = nullptr;
 };
 
 std::vector<std::string> usbEnumerateSerials()
@@ -1962,15 +3260,19 @@ SoapySDR::KwargsList findEspSdr(const SoapySDR::Kwargs &args)
     const auto usbArg = args.find("usb");
     const auto usbSerialArg = args.find("usb_serial");
     const bool wantUsb = (usbArg != args.end() && usbArg->second != "0") || usbSerialArg != args.end();
+    const bool wantEthernet = args.find("host") != args.end() ||
+        (usbArg != args.end() && usbArg->second == "0");
 
-    for (const std::string &serial : usbEnumerateSerials()) {
-        if (usbSerialArg != args.end() && usbSerialArg->second != serial) continue;
-        SoapySDR::Kwargs result = args;
-        result["driver"] = "espsdr";
-        result["usb"] = "1";
-        result["usb_serial"] = serial;
-        result["label"] = "ESP-SDR USB (" + serial + ")";
-        results.push_back(std::move(result));
+    if (!wantEthernet) {
+        for (const std::string &serial : usbEnumerateSerials()) {
+            if (usbSerialArg != args.end() && usbSerialArg->second != serial) continue;
+            SoapySDR::Kwargs result = args;
+            result["driver"] = "espsdr";
+            result["usb"] = "1";
+            result["usb_serial"] = serial;
+            result["label"] = "ESP-SDR USB (" + serial + ")";
+            results.push_back(std::move(result));
+        }
     }
     if (wantUsb) return results;
 
@@ -1979,7 +3281,8 @@ SoapySDR::KwargsList findEspSdr(const SoapySDR::Kwargs &args)
     if (result.count("host") == 0) result["host"] = "esp-sdr.local";
     const unsigned port = result.count("http_port") ? static_cast<unsigned>(std::stoul(result["http_port"])) : 80;
     try {
-        HttpClient http(result["host"], port);
+        HttpClient http(result["host"], port,
+                        result.count("interface") ? result["interface"] : "");
         const Json::Value status = http.get("/api/v1/status");
         result["label"] = "ESP-SDR (" + result["host"] + ")";
         if (status.isMember("ipv4")) result["ipv4"] = status["ipv4"].asString();

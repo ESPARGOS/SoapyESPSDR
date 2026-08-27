@@ -37,7 +37,7 @@ int main(int argc, char **argv)
     std::thread reader;
     int result = 0;
     try {
-        device->setSampleRate(SOAPY_SDR_RX, 0, 2e6);
+        device->setSampleRate(SOAPY_SDR_RX, 0, 16e6);
         stream = device->setupStream(SOAPY_SDR_RX, SOAPY_SDR_CS16);
         if (device->activateStream(stream) != 0) throw std::runtime_error("activateStream failed");
         reader = std::thread([&]() {
@@ -75,7 +75,10 @@ int main(int argc, char **argv)
         change("bandwidth", [&]() { device->setBandwidth(SOAPY_SDR_RX, 0, 21e6); });
         change("agc", [&]() { device->setGainMode(SOAPY_SDR_RX, 0, true); });
         change("manual_gain", [&]() { device->setGain(SOAPY_SDR_RX, 0, 40); });
-        change("sample_rate_2m", [&]() { device->setSampleRate(SOAPY_SDR_RX, 0, 2e6); });
+        change("sample_rate_8m", [&]() { device->setSampleRate(SOAPY_SDR_RX, 0, 8e6); });
+        if (std::abs(device->getSampleRate(SOAPY_SDR_RX, 0) - 8e6) > 1)
+            throw std::runtime_error("8 MSa/s readback mismatch");
+        change("sample_rate_16m", [&]() { device->setSampleRate(SOAPY_SDR_RX, 0, 16e6); });
 
         stop = true;
         reader.join();
@@ -104,8 +107,7 @@ int main(int argc, char **argv)
         device->setBandwidth(SOAPY_SDR_RX, 0, oldBandwidth);
         device->setGain(SOAPY_SDR_RX, 0, oldGain);
         device->setGainMode(SOAPY_SDR_RX, 0, oldAgc);
-        device->setSampleRate(SOAPY_SDR_RX, 0,
-                              std::abs(oldRate - 2e6) < 1 ? oldRate : 2e6);
+        device->setSampleRate(SOAPY_SDR_RX, 0, oldRate);
     } catch (const std::exception &error) {
         std::cerr << "restore failed: " << error.what() << '\n';
         result = 1;

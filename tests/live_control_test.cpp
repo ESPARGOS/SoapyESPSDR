@@ -1,5 +1,6 @@
 #include <SoapySDR/Device.hpp>
 
+#include <algorithm>
 #include <cmath>
 #include <iostream>
 #include <stdexcept>
@@ -20,8 +21,11 @@ int main(int argc, char **argv)
     const double oldFrequency = device->getFrequency(SOAPY_SDR_RX, 0);
     const double oldCorrection = device->getFrequencyCorrection(SOAPY_SDR_RX, 0);
     const double oldBandwidth = device->getBandwidth(SOAPY_SDR_RX, 0);
+    const double oldSampleRate = device->getSampleRate(SOAPY_SDR_RX, 0);
     const double oldGain = device->getGain(SOAPY_SDR_RX, 0);
     const bool oldAgc = device->getGainMode(SOAPY_SDR_RX, 0);
+    const std::string oldFilterOverride = device->readSetting("rx_filter_override");
+    const std::string oldTxGainCode = device->readSetting("tx_gain_code");
     const std::string oldCycleTotal = device->readSetting("cycle_total");
     const std::string oldCycleStream = device->readSetting("cycle_stream");
     int result = 0;
@@ -47,9 +51,47 @@ int main(int argc, char **argv)
         if (device->readSetting("cycle_total") != "5" ||
             device->readSetting("cycle_stream") != "2") throw std::runtime_error("duty-cycle readback mismatch");
         const std::vector<double> rates = device->listSampleRates(SOAPY_SDR_RX, 0);
-        if (rates.size() != 1 || rates.front() != 2e6)
+        if (rates.size() != 10 || rates.front() != 16e6 ||
+            std::find(rates.begin(), rates.end(), 8e6) == rates.end() ||
+            std::find(rates.begin(), rates.end(), 2e6) == rates.end())
             throw std::runtime_error("sample-rate list mismatch");
-        std::cout << "frequency, correction, analog bandwidth, gain, duty cycle, and sample rates: OK\n";
+        for (const double rate : rates) {
+            std::cout << "set sample rate " << rate << '\n';
+            device->setSampleRate(SOAPY_SDR_RX, 0, rate);
+            if (std::abs(device->getSampleRate(SOAPY_SDR_RX, 0) - rate) > 1.0)
+                throw std::runtime_error("sample-rate readback mismatch");
+        }
+        std::cout << "set calibrated TX gain\n";
+        const SoapySDR::Range txGainRange =
+            device->getGainRange(SOAPY_SDR_TX, 0);
+        if (std::abs(txGainRange.minimum() - 0.0) > 1e-9 ||
+            std::abs(txGainRange.maximum() - 19.57) > 1e-9)
+            throw std::runtime_error("TX gain range mismatch");
+        device->setGain(SOAPY_SDR_TX, 0, 3.44);
+        if (std::abs(device->getGain(SOAPY_SDR_TX, 0) - 3.44) > 1e-9 ||
+            device->readSetting("tx_gain_code") != "2")
+            throw std::runtime_error("calibrated TX gain mapping mismatch");
+        device->setGain(SOAPY_SDR_TX, 0, 100.0);
+        if (std::abs(device->getGain(SOAPY_SDR_TX, 0) - 19.57) > 1e-9 ||
+            device->readSetting("tx_gain_code") != "22")
+            throw std::runtime_error("calibrated TX gain clamp mismatch");
+        device->writeSetting("tx_gain_code", "8");
+        if (device->readSetting("tx_gain_code") != "8" ||
+            !std::isnan(device->getGain(SOAPY_SDR_TX, 0)))
+            throw std::runtime_error("expert TX gain code mismatch");
+        std::cout << "check typed AGC sensors\n";
+        device->setGainMode(SOAPY_SDR_RX, 0, true);
+        if (device->readSensor("rx_agc_active") != "true")
+            throw std::runtime_error("AGC active sensor mismatch");
+        if (device->getSensorInfo("rx_agc_active").type !=
+            SoapySDR::ArgInfo::BOOL)
+            throw std::runtime_error("AGC active sensor type mismatch");
+        if (device->getSensorInfo("rx_agc_current_gain").units != "dB")
+            throw std::runtime_error("AGC gain sensor units mismatch");
+        (void)std::stoul(device->readSensor("rx_agc_current_gain"));
+        (void)std::stoul(device->readSensor("rx_agc_robust_peak"));
+        (void)std::stoul(device->readSensor("rx_agc_gain_changes"));
+        std::cout << "frequency, correction, analog bandwidth, RX/TX gain, duty cycle, and sample rates: OK\n";
     } catch (const std::exception &error) {
         std::cerr << error.what() << '\n';
         result = 1;
@@ -58,6 +100,9 @@ int main(int argc, char **argv)
         device->setFrequency(SOAPY_SDR_RX, 0, oldFrequency);
         device->setFrequencyCorrection(SOAPY_SDR_RX, 0, oldCorrection);
         device->setBandwidth(SOAPY_SDR_RX, 0, oldBandwidth);
+        device->setSampleRate(SOAPY_SDR_RX, 0, oldSampleRate);
+        device->writeSetting("rx_filter_override", oldFilterOverride);
+        device->writeSetting("tx_gain_code", oldTxGainCode);
         device->setGain(SOAPY_SDR_RX, 0, oldGain);
         device->setGainMode(SOAPY_SDR_RX, 0, oldAgc);
         device->writeSetting("cycle_total", oldCycleTotal);

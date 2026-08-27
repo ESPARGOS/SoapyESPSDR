@@ -1,8 +1,10 @@
 #include <SoapySDR/Device.hpp>
+#include <SoapySDR/Constants.h>
 #include <SoapySDR/Errors.hpp>
 #include <SoapySDR/Formats.hpp>
 
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <cstdlib>
 #include <iostream>
@@ -23,6 +25,7 @@ int main(int argc, char **argv)
     const double seconds = std::stod(argv[3]);
     const std::string format = argc >= 5 ? argv[4] : SOAPY_SDR_CS16;
     const std::string cycleTotal = argc == 6 ? argv[5] : "1";
+    const unsigned cycleTotalValue = static_cast<unsigned>(std::stoul(cycleTotal));
     SoapySDR::Device *device = SoapySDR::Device::make(args);
     if (device == nullptr) {
         std::cerr << "failed to make device\n";
@@ -35,34 +38,79 @@ int main(int argc, char **argv)
         device->writeSetting("cycle_total", cycleTotal);
         device->writeSetting("cycle_stream", "1");
         stream = device->setupStream(SOAPY_SDR_RX, format);
+        const bool hasHardwareTime = device->hasHardwareTime();
+        const long long hardwareTimeBefore = hasHardwareTime
+            ? device->getHardwareTime() : 0;
         if (device->activateStream(stream) != 0) throw std::runtime_error("activateStream failed");
         std::vector<float> samples(16384 * 2);
         void *buffers[] = {samples.data()};
         uint64_t received = 0;
         uint64_t overflows = 0;
         uint64_t timeouts = 0;
+        uint64_t timedReads = 0;
+        uint64_t missingTimestamps = 0;
+        uint64_t backwardTimestamps = 0;
+        uint64_t timestampGaps = 0;
+        long long previousEndTimeNs = 0;
+        bool havePreviousTime = false;
+        long long firstStreamTimeNs = 0;
+        long long lastStreamTimeNs = 0;
         const auto start = std::chrono::steady_clock::now();
         const auto deadline = start + std::chrono::duration<double>(seconds);
         while (std::chrono::steady_clock::now() < deadline) {
             int flags = 0;
             long long timeNs = 0;
             const int count = device->readStream(stream, buffers, 16384, flags, timeNs, 250000);
-            if (count > 0) received += static_cast<unsigned>(count);
+            if (count > 0) {
+                received += static_cast<unsigned>(count);
+                if ((flags & SOAPY_SDR_HAS_TIME) == 0) {
+                    ++missingTimestamps;
+                } else {
+                    ++timedReads;
+                    if (firstStreamTimeNs == 0) firstStreamTimeNs = timeNs;
+                    lastStreamTimeNs = timeNs;
+                    if (havePreviousTime) {
+                        if (timeNs < previousEndTimeNs)
+                            ++backwardTimestamps;
+                        else if (timeNs > previousEndTimeNs + 2000)
+                            ++timestampGaps;
+                    }
+                    previousEndTimeNs = timeNs + static_cast<long long>(
+                        std::llround(count * 1.0e9 / rate));
+                    havePreviousTime = true;
+                }
+            }
             else if (count == SOAPY_SDR_OVERFLOW) ++overflows;
             else if (count == SOAPY_SDR_TIMEOUT) ++timeouts;
             else throw std::runtime_error("readStream failed: " + std::to_string(count));
         }
         const double elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+        const long long hardwareTimeAfter = hasHardwareTime
+            ? device->getHardwareTime() : 0;
         std::cout << "format=" << format << " rate_hz=" << rate << " elapsed_s=" << elapsed
                   << " samples=" << received << " measured_msa_s=" << received / elapsed / 1e6
-                  << " overflows=" << overflows << " timeouts=" << timeouts;
+                  << " overflows=" << overflows << " timeouts=" << timeouts
+                  << " timed_reads=" << timedReads
+                  << " missing_timestamps=" << missingTimestamps
+                  << " backward_timestamps=" << backwardTimestamps
+                  << " timestamp_gaps=" << timestampGaps
+                  << " has_hardware_time=" << (hasHardwareTime ? 1 : 0)
+                  << " hardware_time_before_ns=" << hardwareTimeBefore
+                  << " hardware_time_after_ns=" << hardwareTimeAfter
+                  << " first_stream_time_ns=" << firstStreamTimeNs
+                  << " last_stream_time_ns=" << lastStreamTimeNs;
         for (const auto &sensor : device->listSensors()) {
             std::cout << ' ' << sensor << '=' << device->readSensor(sensor);
         }
         std::cout << '\n';
         // The interval includes firmware stream startup, so allow a small startup
         // deficit while still requiring continuity once packets arrive.
-        if (overflows != 0 || received < rate * elapsed * 0.95) result = 1;
+        if (overflows != 0 ||
+            received < rate * elapsed / cycleTotalValue * 0.95 ||
+            missingTimestamps != 0 || backwardTimestamps != 0 ||
+            (cycleTotalValue > 1 && timestampGaps == 0) || !hasHardwareTime ||
+            firstStreamTimeNs < hardwareTimeBefore - 1'000'000'000ll ||
+            lastStreamTimeNs > hardwareTimeAfter + 1'000'000'000ll) result = 1;
         device->deactivateStream(stream);
         device->closeStream(stream);
         stream = nullptr;

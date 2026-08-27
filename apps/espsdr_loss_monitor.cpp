@@ -81,6 +81,10 @@ struct Counters {
     uint64_t lost = 0;
     uint64_t firmwareDrops = 0;
     uint64_t invalidDatagrams = 0;
+    uint64_t duplicateDatagrams = 0;
+    uint64_t reorderedDatagrams = 0;
+    uint64_t datagramGaps = 0;
+    uint64_t lateDatagramsRecovered = 0;
     uint64_t queueDrops = 0;
     uint64_t datagrams = 0;
     uint64_t overflows = 0;
@@ -96,6 +100,10 @@ Counters snapshot(SoapySDR::Device *device, uint64_t overflows,
     counters.lost = sensor(device, "lost_chunks");
     counters.firmwareDrops = sensor(device, "firmware_drops");
     counters.invalidDatagrams = sensor(device, "invalid_datagrams");
+    counters.duplicateDatagrams = sensor(device, "duplicate_datagrams");
+    counters.reorderedDatagrams = sensor(device, "reordered_datagrams");
+    counters.datagramGaps = sensor(device, "datagram_gaps");
+    counters.lateDatagramsRecovered = sensor(device, "late_datagrams_recovered");
     counters.queueDrops = sensor(device, "queue_drops");
     counters.datagrams = sensor(device, "datagrams");
     counters.overflows = overflows;
@@ -111,6 +119,10 @@ Counters difference(const Counters &now, const Counters &before)
         now.lost - before.lost,
         now.firmwareDrops - before.firmwareDrops,
         now.invalidDatagrams - before.invalidDatagrams,
+        now.duplicateDatagrams - before.duplicateDatagrams,
+        now.reorderedDatagrams - before.reorderedDatagrams,
+        now.datagramGaps - before.datagramGaps,
+        now.lateDatagramsRecovered - before.lateDatagramsRecovered,
         now.queueDrops - before.queueDrops,
         now.datagrams - before.datagrams,
         now.overflows - before.overflows,
@@ -138,6 +150,10 @@ void printReport(double elapsed, double period, const Counters &delta,
               << delta.overflows / period << ' '
               << delta.firmwareDrops / period << ' '
               << delta.invalidDatagrams / period << ' '
+              << delta.duplicateDatagrams / period << ' '
+              << delta.reorderedDatagrams / period << ' '
+              << delta.datagramGaps / period << ' '
+              << delta.lateDatagramsRecovered / period << ' '
               << delta.queueDrops / period << ' '
               << delta.datagrams / period << '\n';
 }
@@ -184,7 +200,8 @@ int main(int argc, char **argv)
 
         std::cout << "# time_s rx_MSps received_IQ_frames_s missing_IQ_frames_s "
                      "interval_loss_pct total_loss_pct overflows_s firmware_drops_s "
-                     "invalid_datagrams_s queue_drops_s datagrams_s\n";
+                     "invalid_datagrams_s duplicate_datagrams_s reordered_datagrams_s "
+                     "datagram_gaps_s late_datagrams_recovered_s queue_drops_s datagrams_s\n";
 
         while (running) {
             const auto now = std::chrono::steady_clock::now();
@@ -224,6 +241,10 @@ int main(int argc, char **argv)
                   << " overflow_events=" << total.overflows
                   << " firmware_drops=" << total.firmwareDrops
                   << " invalid_datagrams=" << total.invalidDatagrams
+                  << " duplicate_datagrams=" << total.duplicateDatagrams
+                  << " reordered_datagrams=" << total.reorderedDatagrams
+                  << " datagram_gaps=" << total.datagramGaps
+                  << " late_datagrams_recovered=" << total.lateDatagramsRecovered
                   << " queue_drops=" << total.queueDrops
                   << " timeouts=" << total.timeouts << '\n';
 
