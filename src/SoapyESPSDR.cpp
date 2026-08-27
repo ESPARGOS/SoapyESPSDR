@@ -80,6 +80,7 @@ constexpr std::size_t TX_STREAM_BATCH_SAMPLES = 524288;
 constexpr uint16_t TX_UDP_FLAG_AUTOSTART = 1u << 8;
 constexpr unsigned TX_UDP_RATE_CODE_SHIFT = 9;
 constexpr uint16_t TX_UDP_FLAG_MORE = 1u << 13;
+constexpr uint16_t TX_UDP_FLAG_CONTINUE = 1u << 14;
 constexpr unsigned STREAM_SELECTION_MAX = 1'000'000;
 constexpr uint32_t S31_ADC_SOURCE_MUX_MASK = 0x0000000fu;
 constexpr std::size_t REAL_TIMING_TAPS = 25;
@@ -578,6 +579,12 @@ struct RxDatagram {
     uint16_t bytes = 0;
 };
 
+struct TxBurstStatus {
+    int result = 0;
+    bool hasTime = false;
+    long long timeNs = 0;
+};
+
 constexpr uint32_t RX_DATAGRAM_RING_SIZE = 8192;
 
 // 95-tap equiripple half-band filter: 7.2 MHz passband, 8.8 MHz stopband at
@@ -645,9 +652,13 @@ struct StreamState {
     long long txPendingStartTimeNs = 0;
     long long txPendingActualTimeNs = 0;
     bool txChainHasTime = false;
+    uint64_t txChainSubmittedSamples = 0;
+    uint32_t txChainSubmittedSegments = 0;
+    bool txHaveLastContinuationCommit = false;
+    std::chrono::steady_clock::time_point txLastContinuationCommit;
     // writeStream() is synchronous, so a successful finite burst has already
     // reached RF when it is reported through readStreamStatus().
-    std::deque<std::pair<bool, long long>> txBurstStatuses;
+    std::deque<TxBurstStatus> txBurstStatuses;
     // The production IQC8 stream is strictly ordered and has two fragments
     // per frame.  Reuse one assembly buffer for that hot path instead of
     // allocating and updating std::map nodes 31,000 times per second.  The
@@ -1384,6 +1395,9 @@ public:
                 state->txPendingStartTimeNs = 0;
                 state->txPendingActualTimeNs = 0;
                 state->txChainHasTime = false;
+                state->txChainSubmittedSamples = 0;
+                state->txChainSubmittedSegments = 0;
+                state->txHaveLastContinuationCommit = false;
             }
             state->active = true;
             return 0;
@@ -1464,13 +1478,25 @@ public:
             int result = 0;
             {
                 std::lock_guard<std::mutex> lock(state->txWriteMutex);
-                if (!state->txPendingWords.empty()) {
+                const bool continuationExpired =
+                    txContinuationExpired(state);
+                if (continuationExpired) {
+                    state->txPendingWords.clear();
+                    state->txBufferedSamples = 0;
+                    state->txPendingHasTime = false;
+                    state->txPendingStartTimeNs = 0;
+                    state->txPendingActualTimeNs = 0;
+                    std::lock_guard<std::mutex> statusLock(state->mutex);
+                    state->txBurstStatuses.push_back({
+                        SOAPY_SDR_UNDERFLOW, false, 0});
+                } else if (!state->txPendingWords.empty()) {
                     try {
                         state->txPendingActualTimeNs = transmitTxWords(
                             state->txPendingWords, 10'000'000,
                             state->txPendingHasTime
                                 ? state->txPendingStartTimeNs : 0,
-                            false);
+                            false,
+                            state->txChainSubmittedSegments != 0);
                     } catch (const std::exception &error) {
                         SoapySDR::logf(
                             SOAPY_SDR_ERROR,
@@ -1484,6 +1510,9 @@ public:
                     state->txPendingActualTimeNs = 0;
                 }
                 state->txChainHasTime = false;
+                state->txChainSubmittedSamples = 0;
+                state->txChainSubmittedSegments = 0;
+                state->txHaveLastContinuationCommit = false;
             }
             Json::Value patch;
             patch["tx"]["tx_tone_enable"] = 0;
@@ -1658,6 +1687,7 @@ public:
         std::size_t count = 0;
         bool completedHasTime = false;
         long long completedActualTimeNs = 0;
+        int completedStatus = 0;
         try {
             /* Retain one complete host batch until either more input arrives
              * or the application closes the burst. This makes every earlier
@@ -1665,11 +1695,35 @@ public:
              * deactivate can commit a real final (non-MORE) batch. */
             if (state->txPendingWords.size() == TX_STREAM_BATCH_SAMPLES &&
                 numElems != 0) {
+                if (txContinuationExpired(state)) {
+                    state->txPendingWords.clear();
+                    state->txBufferedSamples = 0;
+                    state->txPendingHasTime = false;
+                    state->txPendingStartTimeNs = 0;
+                    state->txPendingActualTimeNs = 0;
+                    state->txChainHasTime = false;
+                    state->txChainSubmittedSamples = 0;
+                    state->txChainSubmittedSegments = 0;
+                    state->txHaveLastContinuationCommit = false;
+                    {
+                        std::lock_guard<std::mutex> lock(state->mutex);
+                        state->txBurstStatuses.push_back({
+                            SOAPY_SDR_UNDERFLOW, false, 0});
+                    }
+                    state->condition.notify_all();
+                    return SOAPY_SDR_UNDERFLOW;
+                }
                 const bool batchHasTime = state->txPendingHasTime;
                 (void)transmitTxWords(
                     state->txPendingWords, timeoutUs,
                     batchHasTime ? state->txPendingStartTimeNs : 0,
-                    true);
+                    true, state->txChainSubmittedSegments != 0);
+                state->txChainSubmittedSamples +=
+                    state->txPendingWords.size();
+                ++state->txChainSubmittedSegments;
+                state->txLastContinuationCommit =
+                    std::chrono::steady_clock::now();
+                state->txHaveLastContinuationCommit = true;
                 state->txChainHasTime =
                     state->txChainHasTime || batchHasTime;
                 state->txPendingWords.clear();
@@ -1720,11 +1774,25 @@ public:
                     state->txPendingWords, timeoutUs,
                     state->txPendingHasTime
                         ? state->txPendingStartTimeNs : 0,
-                    false);
+                    false, state->txChainSubmittedSegments != 0);
+                state->txChainSubmittedSamples +=
+                    state->txPendingWords.size();
+                ++state->txChainSubmittedSegments;
+                const Json::Value replay = statusSnapshot()["tx_replay"];
+                const bool underflow =
+                    replay.get("gap_cycles", 0).asUInt() != 0u ||
+                    replay.get("words", 0).asUInt64() !=
+                        state->txChainSubmittedSamples ||
+                    replay.get("segments", 0).asUInt() !=
+                        state->txChainSubmittedSegments;
+                if (underflow) completedStatus = SOAPY_SDR_UNDERFLOW;
                 state->txPendingWords.clear();
                 state->txPendingHasTime = false;
                 state->txPendingStartTimeNs = 0;
                 state->txChainHasTime = false;
+                state->txChainSubmittedSamples = 0;
+                state->txChainSubmittedSegments = 0;
+                state->txHaveLastContinuationCommit = false;
             }
             state->txBufferedSamples = static_cast<uint32_t>(
                 state->txPendingWords.size());
@@ -1736,6 +1804,9 @@ public:
             state->txPendingHasTime = false;
             state->txPendingStartTimeNs = 0;
             state->txChainHasTime = false;
+            state->txChainSubmittedSamples = 0;
+            state->txChainSubmittedSegments = 0;
+            state->txHaveLastContinuationCommit = false;
             SoapySDR::logf(SOAPY_SDR_WARNING, "TX deadline missed: %s",
                            error.what());
             return SOAPY_SDR_TIME_ERROR;
@@ -1748,8 +1819,9 @@ public:
         if (endBurst) {
             {
                 std::lock_guard<std::mutex> lock(state->mutex);
-                state->txBurstStatuses.emplace_back(
-                    completedHasTime, completedActualTimeNs);
+                state->txBurstStatuses.push_back({
+                    completedStatus, completedHasTime,
+                    completedActualTimeNs});
             }
             state->condition.notify_all();
         }
@@ -1780,9 +1852,9 @@ public:
         state->txBurstStatuses.pop_front();
         chanMask = 1u;
         flags = SOAPY_SDR_END_BURST |
-                (status.first ? SOAPY_SDR_HAS_TIME : 0);
-        timeNs = status.first ? status.second : 0;
-        return 0;
+                (status.hasTime ? SOAPY_SDR_HAS_TIME : 0);
+        timeNs = status.hasTime ? status.timeNs : 0;
+        return status.result;
     }
 
     std::vector<std::string> listSensors() const override
@@ -1964,6 +2036,26 @@ private:
         }
     }
 
+    bool txContinuationExpired(const StreamState *state) const
+    {
+        if (!state->txHaveLastContinuationCommit ||
+            state->txChainSubmittedSegments == 0)
+            return false;
+        /* A normal USB batch takes about 65 ms to upload and represents at
+         * least 118 ms of RF at the fastest supported TX rate. A producer
+         * that has supplied nothing for 200 ms has exhausted the two-batch
+         * device cushion; accepting its retained batch would splice a large
+         * hole into the IQ timeline. Firmware stops 200 ms after its queued
+         * RF data is exhausted, which is at least 318 ms after accepting a
+         * full-rate continuation batch. Enforce underflow before that
+         * earliest stale-restart boundary and avoid extra control transfers
+         * while RF is active. The older prolonged starvation path was also
+         * observed to brown out real hardware. */
+        return std::chrono::steady_clock::now() -
+                   state->txLastContinuationCommit >=
+               std::chrono::milliseconds(200);
+    }
+
     static std::string valueOr(const SoapySDR::Kwargs &args, const std::string &key, const std::string &fallback)
     {
         const auto it = args.find(key);
@@ -2033,7 +2125,8 @@ private:
     long long uploadTxWordsUsb(const std::vector<uint32_t> &words,
                                const long timeoutUs,
                                const long long startTimeNs,
-                               const bool more)
+                               const bool more,
+                               const bool continuation)
     {
         std::lock_guard<std::mutex> controlLock(_controlMutex);
         auto *usbControl = static_cast<UsbControl *>(_control.get());
@@ -2049,6 +2142,7 @@ private:
                 static_cast<uint16_t>(txRateCode(_txSampleRate)
                                       << TX_UDP_RATE_CODE_SHIFT);
             if (more) commitFlags |= TX_UDP_FLAG_MORE;
+            if (continuation) commitFlags |= TX_UDP_FLAG_CONTINUE;
         }
         putLe16(arm.data() + 4, commitFlags);
         putLe64(arm.data() + 8, static_cast<uint64_t>(startTimeNs));
@@ -2128,14 +2222,16 @@ private:
     long long uploadTxWords(const std::vector<uint32_t> &words,
                             const long timeoutUs,
                             const long long startTimeNs,
-                            const bool more)
+                            const bool more,
+                            const bool continuation)
     {
         if (words.empty() || words.size() > TX_REPLAY_MAX_SAMPLES)
             throw std::runtime_error("TX burst must contain 1.." +
                                      std::to_string(TX_REPLAY_MAX_SAMPLES) +
                                      " samples");
         if (_usb != nullptr) {
-            return uploadTxWordsUsb(words, timeoutUs, startTimeNs, more);
+            return uploadTxWordsUsb(words, timeoutUs, startTimeNs, more,
+                                    continuation);
         }
 
         std::lock_guard<std::mutex> controlLock(_controlMutex);
@@ -2287,6 +2383,8 @@ private:
                         static_cast<uint16_t>(txRateCode(_txSampleRate)
                                               << TX_UDP_RATE_CODE_SHIFT);
                     if (more) packetFlags |= TX_UDP_FLAG_MORE;
+                    if (continuation)
+                        packetFlags |= TX_UDP_FLAG_CONTINUE;
                 }
                 putLe16(packet.data() + 26, packetFlags);
                 putLe32(packet.data() + 28, 0);
@@ -2358,13 +2456,15 @@ private:
     long long transmitTxWords(const std::vector<uint32_t> &words,
                               const long timeoutUs,
                               const long long startTimeNs,
-                              const bool more)
+                              const bool more,
+                              const bool continuation)
     {
         if (more && !_txUdpAutostart)
             throw std::runtime_error(
                 "continuous TX requires firmware autostart support");
         const long long actualTimeNs =
-            uploadTxWords(words, timeoutUs, startTimeNs, more);
+            uploadTxWords(words, timeoutUs, startTimeNs, more,
+                          continuation);
         if (_txUdpAutostart) return actualTimeNs;
         Json::Value start;
         start["tx"]["tx_tone0_step"] =

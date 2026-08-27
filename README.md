@@ -310,6 +310,16 @@ the same batch. `SOAPY_SDR_END_BURST` produces an `END_BURST` event through
 RX and TX handles may be created together, but simultaneous activation is
 rejected because the shared RF path is half-duplex.
 
+If the host stops supplying batches for 200 ms, the driver discards its
+retained batch and returns `SOAPY_SDR_UNDERFLOW`; the corresponding
+`readStreamStatus()` event carries `SOAPY_SDR_UNDERFLOW | END_BURST`.
+Firmware independently stops an empty replay queue after 200 ms. An
+underflowed chain must be restarted with a new stream activation: late samples
+are never spliced into the old timeline or allowed to restart RF implicitly.
+Each later wire batch also carries a firmware-enforced continuation marker, so
+an upload that stalls past the device timeout is rejected rather than mistaken
+for the first batch of a new transmission.
+
 For a timed burst, put `SOAPY_SDR_HAS_TIME` and the absolute hardware time on
 the first nonempty `writeStream()` fragment and place `SOAPY_SDR_END_BURST` on
 the last. The host uploads and the firmware prepares the RF path in advance,
