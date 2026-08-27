@@ -2086,10 +2086,10 @@ private:
     const std::vector<double> &txSampleRates() const
     {
         static const std::vector<double> networkRates{
-            4e6, 10e6 / 3.0,
+            4e6, 10e6 / 3.0, 2.5e6, 2e6,
         };
         static const std::vector<double> usbRates{
-            40e6 / 9.0, 4e6, 10e6 / 3.0,
+            40e6 / 9.0, 4e6, 10e6 / 3.0, 2.5e6, 2e6,
         };
         return _usb ? usbRates : networkRates;
     }
@@ -2112,10 +2112,10 @@ private:
     }
     static unsigned txRateCode(const double rate)
     {
-        static const std::array<std::pair<double, unsigned>, 9> rates{{
+        static const std::array<std::pair<double, unsigned>, 11> rates{{
             {80e6, 0}, {40e6, 1}, {80e6 / 3.0, 2}, {20e6, 3},
             {8e6, 7}, {20e6 / 3.0, 8}, {4e6, 9}, {10e6 / 3.0, 10},
-            {40e6 / 9.0, 11},
+            {40e6 / 9.0, 11}, {2.5e6, 12}, {2e6, 13},
         }};
         for (const auto &entry : rates) {
             if (std::abs(rate - entry.first) < 1000.0) return entry.second;
