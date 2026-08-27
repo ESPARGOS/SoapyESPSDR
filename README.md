@@ -88,9 +88,11 @@ and USB control available together; the most recent RX stream start owns the
 half-duplex sample engine.
 
 USB RX uses compact native `IQC8` at the selected RX rate. USB TX arms exact-size
-device allocations, transfers packed IQ10 words in 60 KiB bulk chunks, and
+device allocations, transfers packed IQ10 words in 4 KiB bulk chunks, and
 queues them to the live TXDC engine without a second device-side waveform
-copy. The present implementation is validated lossless at 8 MSa/s RX; a
+copy. Shorter OUT transactions reduce contention with the realtime PSRAM
+reader and materially improve arbitrary-waveform fidelity. The present
+implementation is validated lossless at 8 MSa/s RX; a
 16 MSa/s request reaches about 9.5 MSa/s and reports overflows/gaps, so use
 Gigabit Ethernet for lossless 16 MSa/s. Raw USB device access without root
 requires a udev rule for VID `303a`,

@@ -142,7 +142,7 @@ constexpr std::size_t USB_CTRL_MAX_PAYLOAD = 2048;
 constexpr unsigned USB_CTRL_TIMEOUT_MS = 3000;
 constexpr int USB_STREAM_TRANSFERS = 8;
 constexpr std::size_t USB_STREAM_TRANSFER_BYTES = 256 * 1024;
-constexpr std::size_t USB_TX_TRANSFER_BYTES = 60 * 1024;
+constexpr std::size_t USB_TX_TRANSFER_BYTES = 4 * 1024;
 
 enum UsbControlOpcode : uint32_t {
     USB_OP_GET_STATUS = 1,
