@@ -1798,7 +1798,9 @@ public:
                 "adc_dump_cfg", "adc_dump_mode", "tx_replay_words",
                 "tx_replay_segments", "tx_replay_total_cycles",
                 "tx_replay_sample_cycles", "tx_replay_gap_cycles",
-                "tx_replay_maximum_gap_cycles", "tx_replay_duty_ppm",
+                "tx_replay_maximum_gap_cycles",
+                "tx_replay_deadline_late_max_cycles",
+                "tx_replay_duty_ppm",
                 "tx_replay_requested_start_time_ns",
                 "tx_replay_actual_start_time_ns",
                 "tx_replay_start_error_ns",
@@ -1881,6 +1883,7 @@ public:
             if (key == "tx_replay_sample_cycles") return std::to_string(replay.get("sample_cycles", 0).asUInt());
             if (key == "tx_replay_gap_cycles") return std::to_string(replay.get("gap_cycles", 0).asUInt());
             if (key == "tx_replay_maximum_gap_cycles") return std::to_string(replay.get("maximum_gap_cycles", 0).asUInt());
+            if (key == "tx_replay_deadline_late_max_cycles") return std::to_string(replay.get("deadline_late_max_cycles", 0).asUInt());
             if (key == "tx_replay_requested_start_time_ns") return std::to_string(replay.get("requested_start_time_ns", Json::Int64(0)).asInt64());
             if (key == "tx_replay_actual_start_time_ns") return std::to_string(replay.get("actual_start_time_ns", Json::Int64(0)).asInt64());
             if (key == "tx_replay_start_error_ns") return std::to_string(replay.get("start_error_ns", Json::Int64(0)).asInt64());

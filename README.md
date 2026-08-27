@@ -340,6 +340,10 @@ Bench measurements at 2.38 GHz provide useful scale for this contract:
   USB errors. A ten-batch Soapy/Pluto capture retained all nine seams and its
   RF duration agreed within the 0.256 ms analysis-block resolution. This rate
   is intentionally absent from the Ethernet capability list.
+- `testing/soapy_tx_endurance.py` extended that native-USB result to 500
+  public-API writes: 262,144,000 samples (58.9824 s of RF), 500 firmware
+  segments, zero gaps/errors, and 1.25 us aggregate timing error after reducing
+  the four 32-bit cycle-counter wraps modulo 2^32. RX resumed losslessly.
 - RX activation defaults to continuous 1/1 capture. It does not inherit the
   firmware's deliberately sparse 1/2501 idle-safe boot cadence; applications
   that want duty cycling can still pass `cycle_total` and `cycle_stream`.
@@ -356,6 +360,9 @@ Bench measurements at 2.38 GHz provide useful scale for this contract:
   PSRAM/cache stall can make an individual TXDC write a few microseconds late;
   following samples catch up. This is a modulation-jitter limit even though it
   does not create batch gaps.
+- `tx_replay_deadline_late_max_cycles` exposes the worst observed sample
+  deadline lateness as a Soapy sensor alongside the existing replay duration,
+  segment, gap, start-time, and error counters.
 - The capture firmware now retains PARLIO across same-geometry RX/TX
   ownership changes. Five current RX->TX->RX cycles pass over each transport,
   including explicit end-of-burst, deactivation flush, and rejection of
