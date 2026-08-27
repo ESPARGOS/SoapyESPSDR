@@ -746,19 +746,10 @@ public:
             _gainMax = gain.get("maximum", 76.0).asDouble();
             _gainStep = gain.get("step", 1.0).asDouble();
         }
-        if (args.find("cycle_total") == args.end() &&
-            args.find("cycle_stream") == args.end()) {
-            const Json::Value trigger = _config["trigger"]["trigger_config"];
-            if (trigger.isArray() && trigger.size() >= 3) {
-                const unsigned total = trigger[0].asUInt();
-                const unsigned streamed = trigger[2].asUInt();
-                if (total >= 1 && total <= STREAM_SELECTION_MAX &&
-                    streamed >= 1 && streamed <= total) {
-                    _cycleTotal = total;
-                    _cycleStream = streamed;
-                }
-            }
-        }
+        /* Firmware boots in a deliberately sparse 1/2501 idle-safe mode.
+         * That is not an application preference: a normal Soapy device must
+         * activate as a continuous receiver unless cycle_total/cycle_stream
+         * were explicitly supplied in the device arguments. */
         const auto correction = args.find("frequency_correction_ppm");
         if (correction != args.end()) {
             setFrequencyCorrection(SOAPY_SDR_RX, 0,
@@ -3244,7 +3235,11 @@ private:
             if (std::memcmp(p, "IQU1", 4) != 0 ||
                 le32(p + 48) != static_cast<uint32_t>(crc32(0, p, 48))) {
                 ++pos; // resync byte-wise on the next valid header
-                state->invalidDatagrams++;
+                /* Endpoint reset can leave the tail of one cancelled USB
+                 * transfer ahead of the new stream epoch. Discard that
+                 * startup prefix while acquiring the first valid header;
+                 * once epoch lock exists, retain strict corruption counts. */
+                if (state->haveEpoch) state->invalidDatagrams++;
                 continue;
             }
             const std::size_t total = UDP_HEADER_BYTES + le16(p + 36);

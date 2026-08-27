@@ -338,6 +338,14 @@ Bench measurements at 2.38 GHz provide useful scale for this contract:
   USB errors. A ten-batch Soapy/Pluto capture retained all nine seams and its
   RF duration agreed within the 0.256 ms analysis-block resolution. This rate
   is intentionally absent from the Ethernet capability list.
+- RX activation defaults to continuous 1/1 capture. It does not inherit the
+  firmware's deliberately sparse 1/2501 idle-safe boot cadence; applications
+  that want duty cycling can still pass `cycle_total` and `cycle_stream`.
+- Faster 68--71 cycle/sample candidates were deliberately rejected. Even
+  320/69 MSa/s sent 157,286,400 stress-test samples with exact aggregate timing
+  and zero transport gaps/errors, but wideband repeated-OFDM captures showed
+  roughly ten times as many severe differential-symbol outliers as the
+  72-cycle 40/9 MSa/s rate. At 68 cycles rare lateness reached 27.6 us.
 - Ethernet uses cumulative 256-datagram acknowledgements and 16-frame paced
   flights. Its steady 2 MiB upload latency is about 130.8--131.1 ms at the
   4 MSa/s limit, versus 131.072 ms of RF time. The sub-millisecond pacing loop
@@ -391,6 +399,9 @@ Other current limitations:
   Do not disconnect or reset `enp0s13f0u1u1` automatically: that interrupts
   the user's normal network. Treat concurrent HackRF/ESP loss as a host-bench
   limitation and use the sequence sensors to reject affected measurements.
+  If that interface has carrier but no IP address, verify the route before
+  testing: a route through `wlan0` can validate the ESP Ethernet endpoint at a
+  modest rate, but it is not wired-throughput evidence.
 
 Independent RF smoke tests are available in the firmware tree as
 `testing/hackrf_soapy_rx_probe.py`, `testing/hackrf_soapy_tx_probe.py`, and
