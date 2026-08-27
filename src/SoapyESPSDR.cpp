@@ -1997,12 +1997,15 @@ private:
         if (channel != 0 || (direction != SOAPY_SDR_RX && direction != SOAPY_SDR_TX))
             throw std::runtime_error("SoapyESPSDR supports channel 0 only");
     }
-    static const std::vector<double> &txSampleRates()
+    const std::vector<double> &txSampleRates() const
     {
-        static const std::vector<double> rates{
+        static const std::vector<double> networkRates{
             4e6, 10e6 / 3.0,
         };
-        return rates;
+        static const std::vector<double> usbRates{
+            40e6 / 9.0, 4e6, 10e6 / 3.0,
+        };
+        return _usb ? usbRates : networkRates;
     }
     static const std::vector<double> &rxSampleRates()
     {
@@ -2023,9 +2026,10 @@ private:
     }
     static unsigned txRateCode(const double rate)
     {
-        static const std::array<std::pair<double, unsigned>, 8> rates{{
+        static const std::array<std::pair<double, unsigned>, 9> rates{{
             {80e6, 0}, {40e6, 1}, {80e6 / 3.0, 2}, {20e6, 3},
             {8e6, 7}, {20e6 / 3.0, 8}, {4e6, 9}, {10e6 / 3.0, 10},
+            {40e6 / 9.0, 11},
         }};
         for (const auto &entry : rates) {
             if (std::abs(rate - entry.first) < 1000.0) return entry.second;

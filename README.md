@@ -157,7 +157,8 @@ SOAPY_SDR_PLUGIN_PATH=/home/florian/prgm/esp32/SoapyESPSDR/build gqrx
 - Signed frontend frequency correction from -100 to +100 ppm
 - Continuous complex RX at 16 MSa/s divided by an integer from 1 through 10:
   16, 8, 5.333, 4, 3.2, 2.667, 2.286, 2, 1.778, and 1.6 MSa/s
-- Continuous TX rates of 4 and 3.333 MSa/s
+- Continuous TX rates of 4.444, 4, and 3.333 MSa/s over native USB; Ethernet
+  advertises 4 and 3.333 MSa/s
 - Automatic or manual receive gain
 - Manual receive gain from 0 to 69 dB in 1 dB steps on the tested board
 - Calibrated relative TX gain from 0 to 19.57 dB
@@ -332,6 +333,11 @@ Bench measurements at 2.38 GHz provide useful scale for this contract:
 - Ten batches at 10/3 MSa/s measured 1.572864 s over Ethernet (exact at the
   Pluto detector's 512-sample resolution) and 1.573120 s over USB, again with
   zero boundary-gap cycles and flat seams.
+- Native USB additionally sustains 40/9 MSa/s. A 50-batch run sent 26,214,400
+  samples in 5.8982415 s versus 5.8982400 s ideal, with zero firmware gaps and
+  USB errors. A ten-batch Soapy/Pluto capture retained all nine seams and its
+  RF duration agreed within the 0.256 ms analysis-block resolution. This rate
+  is intentionally absent from the Ethernet capability list.
 - Ethernet uses cumulative 256-datagram acknowledgements and 16-frame paced
   flights. Its steady 2 MiB upload latency is about 130.8--131.1 ms at the
   4 MSa/s limit, versus 131.072 ms of RF time. The sub-millisecond pacing loop
@@ -373,8 +379,8 @@ Other current limitations:
   exceeded the combined S31 PARLIO/PSRAM/GMAC path even though the raw Gigabit
   link budget was sufficient.
 - Native USB enumerates at 480 Mbit/s and is validated for Soapy control,
-  lossless 8 MSa/s RX, continuous 4 and 3.333 MSa/s TX, and repeated RX/TX
-  switching.
+  lossless 8 MSa/s RX, continuous 4.444, 4, and 3.333 MSa/s TX, and repeated
+  RX/TX switching.
   Its current endpoint path reaches about 9.5 MSa/s under a 16 MSa/s request,
   with honest overflow/gap reporting; use Ethernet for lossless 16 MSa/s.
 - On this bench, `enp0s13f0u1u1` is the host's normal internet/LAN uplink
