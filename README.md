@@ -159,7 +159,7 @@ SOAPY_SDR_PLUGIN_PATH=/home/florian/prgm/esp32/SoapyESPSDR/build gqrx
 - Signed frontend frequency correction from -100 to +100 ppm
 - Continuous complex RX at 16 MSa/s divided by an integer from 1 through 10:
   16, 8, 5.333, 4, 3.2, 2.667, 2.286, 2, 1.778, and 1.6 MSa/s
-- Continuous TX rates of 4.444, 4, 3.333, 2.5, and 2 MSa/s over native USB;
+- Continuous TX rates of 5, 4.444, 4, 3.333, 2.5, and 2 MSa/s over native USB;
   Ethernet advertises 4, 3.333, 2.5, and 2 MSa/s
 - Automatic or manual receive gain
 - Manual receive gain from 0 to 69 dB in 1 dB steps on the tested board
@@ -356,6 +356,13 @@ Bench measurements at 2.38 GHz provide useful scale for this contract:
   USB errors. A ten-batch Soapy/Pluto capture retained all nine seams and its
   RF duration agreed within the 0.256 ms analysis-block resolution. This rate
   is intentionally absent from the Ethernet capability list.
+- Native USB also exposes a 5 MSa/s TCM-staged backend. A 100-batch run sent
+  52,428,800 samples in 10.48576 s with zero USB errors and aggregate timing
+  176 CPU cycles from ideal. HackRF measured 62.7 dB tone-to-spectral-median,
+  45.2 dB image rejection, and no clipping through the public Soapy API.
+  Measured TCM-slot handoff jitter reached roughly 1 us in the resource-safe
+  build, so 40/9 MSa/s remains the conservative choice for especially
+  phase-sensitive work.
 - `testing/soapy_tx_endurance.py` extended that native-USB result to 500
   public-API writes: 262,144,000 samples (58.9824 s of RF), 500 firmware
   segments, zero gaps/errors, and 1.25 us aggregate timing error after reducing
@@ -412,7 +419,7 @@ Other current limitations:
   exceeded the combined S31 PARLIO/PSRAM/GMAC path even though the raw Gigabit
   link budget was sufficient.
 - Native USB enumerates at 480 Mbit/s and is validated for Soapy control,
-  lossless 8 MSa/s RX, continuous 4.444 through 2 MSa/s TX, and repeated
+  lossless 8 MSa/s RX, continuous 5 through 2 MSa/s TX, and repeated
   RX/TX switching.
   Its current endpoint path reaches about 9.5 MSa/s under a 16 MSa/s request,
   with honest overflow/gap reporting; use Ethernet for lossless 16 MSa/s.

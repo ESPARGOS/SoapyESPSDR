@@ -2089,7 +2089,7 @@ private:
             4e6, 10e6 / 3.0, 2.5e6, 2e6,
         };
         static const std::vector<double> usbRates{
-            40e6 / 9.0, 4e6, 10e6 / 3.0, 2.5e6, 2e6,
+            5e6, 40e6 / 9.0, 4e6, 10e6 / 3.0, 2.5e6, 2e6,
         };
         return _usb ? usbRates : networkRates;
     }
@@ -2112,10 +2112,10 @@ private:
     }
     static unsigned txRateCode(const double rate)
     {
-        static const std::array<std::pair<double, unsigned>, 11> rates{{
+        static const std::array<std::pair<double, unsigned>, 12> rates{{
             {80e6, 0}, {40e6, 1}, {80e6 / 3.0, 2}, {20e6, 3},
             {8e6, 7}, {20e6 / 3.0, 8}, {4e6, 9}, {10e6 / 3.0, 10},
-            {40e6 / 9.0, 11}, {2.5e6, 12}, {2e6, 13},
+            {40e6 / 9.0, 11}, {2.5e6, 12}, {2e6, 13}, {5e6, 14},
         }};
         for (const auto &entry : rates) {
             if (std::abs(rate - entry.first) < 1000.0) return entry.second;
@@ -2180,7 +2180,23 @@ private:
                 }
                 offset += count;
             }
-            usbControl->rawRequest(USB_OP_TX_COMMIT, nullptr, 0);
+            /* DWC2 may ACK the final TX-OUT packet before TinyUSB dispatches
+             * that endpoint's completion callback. A following control-EP
+             * commit can then overtake it in the device task even though the
+             * synchronous libusb write has completed. Retry only this
+             * explicitly transient response; every other protocol error is
+             * still terminal. */
+            for (unsigned attempt = 0;; ++attempt) {
+                try {
+                    usbControl->rawRequest(USB_OP_TX_COMMIT, nullptr, 0);
+                    break;
+                } catch (const std::runtime_error &error) {
+                    if (attempt >= 19 || std::string(error.what()).find(
+                            "USB TX upload is incomplete") == std::string::npos)
+                        throw;
+                    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                }
+            }
             armed = false;
 
             if (_txUdpAutostart) {
