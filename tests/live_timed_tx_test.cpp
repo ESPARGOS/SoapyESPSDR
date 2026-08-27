@@ -33,7 +33,7 @@ int main(int argc, char **argv)
             throw std::runtime_error("hardware time is not advertised");
         device->setFrequency(SOAPY_SDR_TX, 0, 2.38e9);
         device->setBandwidth(SOAPY_SDR_TX, 0, 20e6);
-        const double sampleRate = argc == 4 ? std::stod(argv[3]) : 20e6;
+        const double sampleRate = argc == 4 ? std::stod(argv[3]) : 4e6;
         device->setSampleRate(SOAPY_SDR_TX, 0, sampleRate);
         device->setGain(SOAPY_SDR_TX, 0, 4);
 

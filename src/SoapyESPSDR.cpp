@@ -72,10 +72,14 @@ constexpr uint32_t IQ_AGC_GAIN_CHANGES_MASK = 0xffffu;
 constexpr std::size_t TX_UDP_HEADER_BYTES = 36;
 constexpr std::size_t TX_UDP_ACK_BYTES = 40;
 constexpr std::size_t TX_UDP_WORDS_PER_DATAGRAM = 350;
+constexpr std::size_t TX_UDP_ACK_WINDOW_DATAGRAMS = 256;
+constexpr std::size_t TX_UDP_PACING_BURST_DATAGRAMS = 16;
 constexpr std::size_t TX_REPLAY_SEGMENT_SAMPLES = 16383;
 constexpr std::size_t TX_REPLAY_MAX_SAMPLES = TX_REPLAY_SEGMENT_SAMPLES * 64;
+constexpr std::size_t TX_STREAM_BATCH_SAMPLES = 524288;
 constexpr uint16_t TX_UDP_FLAG_AUTOSTART = 1u << 8;
 constexpr unsigned TX_UDP_RATE_CODE_SHIFT = 9;
+constexpr uint16_t TX_UDP_FLAG_MORE = 1u << 13;
 constexpr unsigned STREAM_SELECTION_MAX = 1'000'000;
 constexpr uint32_t S31_ADC_SOURCE_MUX_MASK = 0x0000000fu;
 constexpr std::size_t REAL_TIMING_TAPS = 25;
@@ -292,7 +296,25 @@ private:
         if (!_interface.empty())
             curl_easy_setopt(curl.get(), CURLOPT_INTERFACE,
                              _interface.c_str());
-        const CURLcode result = curl_easy_perform(curl.get());
+        CURLcode result = CURLE_OK;
+        for (unsigned attempt = 0; attempt < 3; ++attempt) {
+            response.clear();
+            result = curl_easy_perform(curl.get());
+            if (result == CURLE_OK) break;
+            const bool transient =
+                result == CURLE_COULDNT_RESOLVE_HOST ||
+                result == CURLE_COULDNT_CONNECT ||
+                result == CURLE_OPERATION_TIMEDOUT ||
+                result == CURLE_SEND_ERROR ||
+                result == CURLE_RECV_ERROR ||
+                result == CURLE_GOT_NOTHING;
+            if (!transient || attempt + 1 == 3) break;
+            /* The ESP HTTP server can briefly have all sockets retiring after
+             * a rapid RX/TX ownership sequence. A bounded retry makes normal
+             * Soapy control robust without masking protocol or HTTP errors. */
+            std::this_thread::sleep_for(
+                std::chrono::milliseconds(25u * (attempt + 1u)));
+        }
         if (result != CURLE_OK) {
             throw std::runtime_error("HTTP request to " + url + " failed: " + curl_easy_strerror(result));
         }
@@ -622,6 +644,7 @@ struct StreamState {
     bool txPendingHasTime = false;
     long long txPendingStartTimeNs = 0;
     long long txPendingActualTimeNs = 0;
+    bool txChainHasTime = false;
     // writeStream() is synchronous, so a successful finite burst has already
     // reached RF when it is reported through readStreamStatus().
     std::deque<std::pair<bool, long long>> txBurstStatuses;
@@ -1336,7 +1359,7 @@ public:
     std::size_t getStreamMTU(SoapySDR::Stream *stream) const override
     {
         const auto *state = checkedStream(stream);
-        if (state->direction == SOAPY_SDR_TX) return TX_REPLAY_MAX_SAMPLES;
+        if (state->direction == SOAPY_SDR_TX) return TX_STREAM_BATCH_SAMPLES;
         /* Host reads can aggregate multiple native IQC8 frames, so retain the
          * established 2048-complex-sample block as the public MTU on either
          * transport. */
@@ -1364,11 +1387,12 @@ public:
                 std::scoped_lock lock(state->mutex, state->txWriteMutex);
                 state->txBurstStatuses.clear();
                 state->txPendingWords.clear();
-                state->txPendingWords.reserve(TX_REPLAY_MAX_SAMPLES);
+                state->txPendingWords.reserve(TX_STREAM_BATCH_SAMPLES);
                 state->txBufferedSamples = 0;
                 state->txPendingHasTime = false;
                 state->txPendingStartTimeNs = 0;
                 state->txPendingActualTimeNs = 0;
+                state->txChainHasTime = false;
             }
             state->active = true;
             return 0;
@@ -1454,7 +1478,8 @@ public:
                         state->txPendingActualTimeNs = transmitTxWords(
                             state->txPendingWords, 10'000'000,
                             state->txPendingHasTime
-                                ? state->txPendingStartTimeNs : 0);
+                                ? state->txPendingStartTimeNs : 0,
+                            false);
                     } catch (const std::exception &error) {
                         SoapySDR::logf(
                             SOAPY_SDR_ERROR,
@@ -1467,6 +1492,7 @@ public:
                     state->txPendingStartTimeNs = 0;
                     state->txPendingActualTimeNs = 0;
                 }
+                state->txChainHasTime = false;
             }
             Json::Value patch;
             patch["tx"]["tx_tone_enable"] = 0;
@@ -1626,7 +1652,8 @@ public:
                         timeNs <= getHardwareTime())) {
             return SOAPY_SDR_TIME_ERROR;
         }
-        if (!hasTime && flushRequested && state->txPendingHasTime &&
+        if (!hasTime && (numElems != 0 || flushRequested) &&
+            state->txPendingHasTime &&
             state->txPendingStartTimeNs <= getHardwareTime()) {
             /* A fragmented application may miss its deadline before sending
              * END_BURST. Discard the unsent batch so deactivation cannot
@@ -1637,16 +1664,35 @@ public:
             state->txPendingStartTimeNs = 0;
             return SOAPY_SDR_TIME_ERROR;
         }
-        const std::size_t available =
-            TX_REPLAY_MAX_SAMPLES - state->txPendingWords.size();
-        const std::size_t count = std::min(numElems, available);
+        std::size_t count = 0;
         bool completedHasTime = false;
         long long completedActualTimeNs = 0;
         try {
+            /* Retain one complete host batch until either more input arrives
+             * or the application closes the burst. This makes every earlier
+             * commit unambiguously MORE while guaranteeing that END_BURST or
+             * deactivate can commit a real final (non-MORE) batch. */
+            if (state->txPendingWords.size() == TX_STREAM_BATCH_SAMPLES &&
+                numElems != 0) {
+                const bool batchHasTime = state->txPendingHasTime;
+                (void)transmitTxWords(
+                    state->txPendingWords, timeoutUs,
+                    batchHasTime ? state->txPendingStartTimeNs : 0,
+                    true);
+                state->txChainHasTime =
+                    state->txChainHasTime || batchHasTime;
+                state->txPendingWords.clear();
+                state->txBufferedSamples = 0;
+                state->txPendingHasTime = false;
+                state->txPendingStartTimeNs = 0;
+            }
             if (hasTime) {
                 state->txPendingHasTime = true;
                 state->txPendingStartTimeNs = timeNs;
             }
+            const std::size_t available =
+                TX_STREAM_BATCH_SAMPLES - state->txPendingWords.size();
+            count = std::min(numElems, available);
             for (std::size_t i = 0; i < count; ++i) {
                 int32_t iv = 0;
                 int32_t qv = 0;
@@ -1675,27 +1721,19 @@ public:
                 state->txPendingWords.push_back(
                     (static_cast<uint32_t>(iv) & 0x3ffu) |
                     ((static_cast<uint32_t>(qv) & 0x3ffu) << 10));
-                if (state->txPendingWords.size() == TX_REPLAY_MAX_SAMPLES) {
-                    completedHasTime = state->txPendingHasTime;
-                    completedActualTimeNs = transmitTxWords(
-                        state->txPendingWords, timeoutUs,
-                        state->txPendingHasTime
-                            ? state->txPendingStartTimeNs : 0);
-                    state->txPendingWords.clear();
-                    state->txBufferedSamples = 0;
-                    state->txPendingHasTime = false;
-                    state->txPendingStartTimeNs = 0;
-                }
             }
             if (flushRequested && !state->txPendingWords.empty()) {
-                completedHasTime = state->txPendingHasTime;
+                completedHasTime =
+                    state->txChainHasTime || state->txPendingHasTime;
                 completedActualTimeNs = transmitTxWords(
                     state->txPendingWords, timeoutUs,
                     state->txPendingHasTime
-                        ? state->txPendingStartTimeNs : 0);
+                        ? state->txPendingStartTimeNs : 0,
+                    false);
                 state->txPendingWords.clear();
                 state->txPendingHasTime = false;
                 state->txPendingStartTimeNs = 0;
+                state->txChainHasTime = false;
             }
             state->txBufferedSamples = static_cast<uint32_t>(
                 state->txPendingWords.size());
@@ -1706,6 +1744,7 @@ public:
             state->txBufferedSamples = 0;
             state->txPendingHasTime = false;
             state->txPendingStartTimeNs = 0;
+            state->txChainHasTime = false;
             SoapySDR::logf(SOAPY_SDR_WARNING, "TX deadline missed: %s",
                            error.what());
             return SOAPY_SDR_TIME_ERROR;
@@ -1723,7 +1762,7 @@ public:
             }
             state->condition.notify_all();
         }
-        flags &= SOAPY_SDR_END_BURST;
+        if (count == numElems) flags &= SOAPY_SDR_END_BURST;
         return static_cast<int>(count);
     }
 
@@ -1961,7 +2000,6 @@ private:
     static const std::vector<double> &txSampleRates()
     {
         static const std::vector<double> rates{
-            80e6, 40e6, 80e6 / 3.0, 20e6, 8e6, 20e6 / 3.0,
             4e6, 10e6 / 3.0,
         };
         return rates;
@@ -1996,7 +2034,8 @@ private:
     }
     long long uploadTxWordsUsb(const std::vector<uint32_t> &words,
                                const long timeoutUs,
-                               const long long startTimeNs)
+                               const long long startTimeNs,
+                               const bool more)
     {
         std::lock_guard<std::mutex> controlLock(_controlMutex);
         auto *usbControl = static_cast<UsbControl *>(_control.get());
@@ -2011,6 +2050,7 @@ private:
             commitFlags = TX_UDP_FLAG_AUTOSTART |
                 static_cast<uint16_t>(txRateCode(_txSampleRate)
                                       << TX_UDP_RATE_CODE_SHIFT);
+            if (more) commitFlags |= TX_UDP_FLAG_MORE;
         }
         putLe16(arm.data() + 4, commitFlags);
         putLe64(arm.data() + 8, static_cast<uint64_t>(startTimeNs));
@@ -2052,6 +2092,7 @@ private:
             armed = false;
 
             if (_txUdpAutostart) {
+                if (more) return 0;
                 while (std::chrono::steady_clock::now() < deadline) {
                     const Json::Value status =
                         _control->get("/api/v1/status");
@@ -2088,18 +2129,20 @@ private:
     }
     long long uploadTxWords(const std::vector<uint32_t> &words,
                             const long timeoutUs,
-                            const long long startTimeNs)
+                            const long long startTimeNs,
+                            const bool more)
     {
         if (words.empty() || words.size() > TX_REPLAY_MAX_SAMPLES)
             throw std::runtime_error("TX burst must contain 1.." +
                                      std::to_string(TX_REPLAY_MAX_SAMPLES) +
                                      " samples");
         if (_usb != nullptr) {
-            return uploadTxWordsUsb(words, timeoutUs, startTimeNs);
+            return uploadTxWordsUsb(words, timeoutUs, startTimeNs, more);
         }
 
         std::lock_guard<std::mutex> controlLock(_controlMutex);
         Json::Value armRequest(Json::objectValue);
+        armRequest["word_count"] = Json::UInt64(words.size());
         if (startTimeNs != 0)
             armRequest["start_time_ns"] = Json::Int64(startTimeNs);
         const Json::Value arm = _control->post(
@@ -2163,7 +2206,8 @@ private:
         const auto deadline = std::chrono::steady_clock::now() + timeout;
         std::size_t resumeOffset = 0;
 
-        auto receiveAck = [&](int waitMs, std::size_t &received) -> bool {
+        auto receiveAck = [&](int waitMs, std::size_t &received,
+                              bool &committed) -> bool {
             pollfd descriptor{socketFd, POLLIN, 0};
             if (::poll(&descriptor, 1, waitMs) <= 0) return false;
             std::array<uint8_t, TX_UDP_ACK_BYTES> ack{};
@@ -2177,20 +2221,57 @@ private:
                 le32(ack.data() + 36) !=
                     static_cast<uint32_t>(crc32(0, ack.data(), 36))) return false;
             received = le32(ack.data() + 20);
-            return le32(ack.data() + 24) == words.size() &&
-                   le32(ack.data() + 32) > beforeCommits;
+            committed = le32(ack.data() + 24) == words.size() &&
+                        le32(ack.data() + 32) > beforeCommits;
+            return true;
+        };
+
+        auto finishCommitted = [&]() -> long long {
+            if (!_txUdpAutostart || more) return 0;
+            /* The commit ACK means ownership and the replay request were
+             * accepted. Wait until the queued replay has completed so an
+             * immediate deactivate cannot overwrite that request. */
+            while (std::chrono::steady_clock::now() < deadline) {
+                const Json::Value status = _control->get("/api/v1/status");
+                cacheStatus(status);
+                const Json::Value replay = status["tx_replay"];
+                const long long requested = replay.get(
+                    "requested_start_time_ns", Json::Int64(0)).asInt64();
+                if (!status.get("config_applying", false).asBool() &&
+                    (startTimeNs == 0 || requested == startTimeNs)) {
+                    const long long actual = replay.get(
+                        "actual_start_time_ns", Json::Int64(0)).asInt64();
+                    if (startTimeNs != 0 &&
+                        (actual == 0 || replay.get(
+                            "deadline_missed", false).asBool()))
+                        throw TimedTxError(
+                            "deadline passed during Ethernet waveform staging");
+                    return actual;
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(25));
+            }
+            throw std::runtime_error(
+                "timed out waiting for TX replay completion");
         };
 
         bool recovery = false;
-        while (std::chrono::steady_clock::now() < deadline) {
-            const bool reset = resumeOffset == 0;
+        std::array<uint8_t, TX_UDP_HEADER_BYTES +
+                                TX_UDP_WORDS_PER_DATAGRAM * 4> packet{};
+        while (resumeOffset < words.size() &&
+               std::chrono::steady_clock::now() < deadline) {
+            const std::size_t windowStart = resumeOffset;
+            const std::size_t windowEnd = std::min(
+                words.size(), windowStart +
+                    TX_UDP_ACK_WINDOW_DATAGRAMS *
+                    TX_UDP_WORDS_PER_DATAGRAM);
+            const bool reset = windowStart == 0;
             auto pacingDeadline = std::chrono::steady_clock::now();
-            for (std::size_t offset = resumeOffset; offset < words.size();
+            for (std::size_t offset = windowStart; offset < windowEnd;
                  offset += TX_UDP_WORDS_PER_DATAGRAM) {
                 const std::size_t count = std::min(
                     TX_UDP_WORDS_PER_DATAGRAM, words.size() - offset);
                 const bool final = offset + count == words.size();
-                std::vector<uint8_t> packet(TX_UDP_HEADER_BYTES + count * 4);
+                const bool windowFinal = offset + count >= windowEnd;
                 std::memcpy(packet.data(), "IQT1", 4);
                 putLe16(packet.data() + 4, 1);
                 putLe16(packet.data() + 6, TX_UDP_HEADER_BYTES);
@@ -2201,66 +2282,74 @@ private:
                 putLe32(packet.data() + 20, static_cast<uint32_t>(offset));
                 putLe16(packet.data() + 24, static_cast<uint16_t>(count));
                 uint16_t packetFlags = (reset && offset == 0 ? 1u : 0u) |
-                                       (final ? 2u | 4u : 0u);
+                                       (final ? 2u : 0u) |
+                                       (windowFinal ? 4u : 0u);
                 if (final && _txUdpAutostart) {
                     packetFlags |= TX_UDP_FLAG_AUTOSTART |
                         static_cast<uint16_t>(txRateCode(_txSampleRate)
                                               << TX_UDP_RATE_CODE_SHIFT);
+                    if (more) packetFlags |= TX_UDP_FLAG_MORE;
                 }
                 putLe16(packet.data() + 26, packetFlags);
                 putLe32(packet.data() + 28, 0);
                 putLe32(packet.data() + 32,
                         static_cast<uint32_t>(crc32(0, packet.data(), 32)));
                 uint8_t *payload = packet.data() + TX_UDP_HEADER_BYTES;
+#if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+                std::memcpy(payload, words.data() + offset, count * 4);
+#else
                 for (std::size_t i = 0; i < count; ++i)
                     putLe32(payload + i * 4, words[offset + i]);
-                if (::send(socketFd, packet.data(), packet.size(), 0) !=
-                    static_cast<ssize_t>(packet.size()))
+#endif
+                const std::size_t packetBytes =
+                    TX_UDP_HEADER_BYTES + count * 4;
+                if (::send(socketFd, packet.data(), packetBytes, 0) !=
+                    static_cast<ssize_t>(packetBytes))
                     throw std::runtime_error("TX UDP send failed");
-                pacingDeadline += std::chrono::microseconds(recovery ? 75 : 50);
-                std::this_thread::sleep_until(pacingDeadline);
+                // The S31 raw-Ethernet receive path can sustain the stream rate,
+                // but a 50 us burst cadence can overrun its descriptor queue.
+                // The direct ring-drain firmware sustains 16-frame flights at
+                // a 65 us mean cadence (about 21.5 MB/s payload), leaving the
+                // control/allocation margin needed by a 16 MB/s IQ stream.
+                // Do not use sleep_until() for this sub-millisecond deadline:
+                // scheduler wake-up latency accumulated once per Ethernet frame
+                // reduces an otherwise lossless 2 MiB upload to well below the
+                // radio sample rate on a normal desktop kernel.
+                pacingDeadline += std::chrono::microseconds(recovery ? 75 : 65);
+                const std::size_t flightPacket =
+                    (offset - windowStart) / TX_UDP_WORDS_PER_DATAGRAM + 1;
+                if (flightPacket % TX_UDP_PACING_BURST_DATAGRAMS == 0 ||
+                    windowFinal) {
+                    while (std::chrono::steady_clock::now() < pacingDeadline) {
+                        // A full 2 MiB batch occupies one host core for about
+                        // 97 ms. Yielding here reintroduces millisecond-scale
+                        // scheduling jitter and descriptor-ring bursts.
+                    }
+                }
             }
 
-            std::size_t received = resumeOffset;
+            std::size_t received = windowStart;
+            bool committed = false;
             const int remainingMs = static_cast<int>(std::max<int64_t>(
                 1, std::chrono::duration_cast<std::chrono::milliseconds>(
                        deadline - std::chrono::steady_clock::now()).count()));
-            if (receiveAck(std::min(remainingMs, 25), received)) {
-                if (_txUdpAutostart) {
-                    /* The commit ACK means ownership and the replay request
-                     * were accepted. Wait until the short queued replay has
-                     * completed so an immediate deactivate or next write
-                     * cannot overwrite that request. */
-                    while (std::chrono::steady_clock::now() < deadline) {
-                        const Json::Value status =
-                            _control->get("/api/v1/status");
-                        cacheStatus(status);
-                        const Json::Value replay = status["tx_replay"];
-                        const long long requested = replay.get(
-                            "requested_start_time_ns",
-                            Json::Int64(0)).asInt64();
-                        if (!status.get("config_applying", false).asBool() &&
-                            (startTimeNs == 0 || requested == startTimeNs)) {
-                            const long long actual = replay.get(
-                                "actual_start_time_ns", Json::Int64(0)).asInt64();
-                            if (startTimeNs != 0 &&
-                                (actual == 0 || replay.get(
-                                    "deadline_missed", false).asBool()))
-                                throw TimedTxError(
-                                    "deadline passed during Ethernet waveform staging");
-                            return actual;
-                        }
-                        std::this_thread::sleep_for(
-                            std::chrono::milliseconds(25));
-                    }
-                    throw std::runtime_error(
-                        "timed out waiting for TX replay completion");
+            if (receiveAck(std::min(remainingMs, 25), received, committed)) {
+                if (committed) return finishCommitted();
+                if (received >= windowEnd) {
+                    resumeOffset = windowEnd;
+                    recovery = false;
+                    continue;
                 }
-                return 0;
             }
-            if (received < words.size() &&
+            if (received < windowEnd &&
                 received % TX_UDP_WORDS_PER_DATAGRAM == 0) {
                 resumeOffset = received;
+                recovery = true;
+            } else {
+                /* A cumulative ACK can itself be lost. Replaying only this
+                 * bounded window is cheap; its RESET bit also restores a
+                 * deterministic session when packet zero was the loss. */
+                resumeOffset = windowStart;
                 recovery = true;
             }
         }
@@ -2270,10 +2359,14 @@ private:
     }
     long long transmitTxWords(const std::vector<uint32_t> &words,
                               const long timeoutUs,
-                              const long long startTimeNs)
+                              const long long startTimeNs,
+                              const bool more)
     {
+        if (more && !_txUdpAutostart)
+            throw std::runtime_error(
+                "continuous TX requires firmware autostart support");
         const long long actualTimeNs =
-            uploadTxWords(words, timeoutUs, startTimeNs);
+            uploadTxWords(words, timeoutUs, startTimeNs, more);
         if (_txUdpAutostart) return actualTimeNs;
         Json::Value start;
         start["tx"]["tx_tone0_step"] =
@@ -3222,7 +3315,7 @@ private:
     double _gainMin = 0.0;
     double _gainMax = 76.0;
     double _gainStep = 1.0;
-    double _txSampleRate = 20e6;
+    double _txSampleRate = 4e6;
     bool _txUdpAutostart = false;
     StreamState *_rxStream = nullptr;
     StreamState *_txStream = nullptr;

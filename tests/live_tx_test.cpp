@@ -34,7 +34,7 @@ int main(int argc, char **argv)
             throw std::runtime_error("TX channel is not advertised");
         device->setFrequency(SOAPY_SDR_TX, 0, 2.38e9);
         device->setBandwidth(SOAPY_SDR_TX, 0, 20e6);
-        device->setSampleRate(SOAPY_SDR_TX, 0, 20e6);
+        device->setSampleRate(SOAPY_SDR_TX, 0, 4e6);
         device->setGain(SOAPY_SDR_TX, 0, 4);
 
         const std::size_t count = argc == 3
@@ -92,7 +92,7 @@ int main(int argc, char **argv)
         device->closeStream(stream);
         stream = nullptr;
         std::cout << "SoapySDR fragmented TX burst: " << totalWritten
-                  << " samples at 20 MSa/s, 2380 MHz in " << writeSeconds
+                  << " samples at 4 MSa/s, 2380 MHz in " << writeSeconds
                   << " s: OK\n";
     } catch (const std::exception &error) {
         std::cerr << error.what() << '\n';

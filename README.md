@@ -6,7 +6,7 @@ SoapyESPSDR is a SoapySDR transceiver driver for ESP-SDR by
 [ESPARGOS](https://espargos.net/).
 
 ESP-SDR is firmware for the ESP32-S31 Function-CoreBoard that provides native
-I/Q receive and arbitrary finite-burst I/Q transmit over Gigabit Ethernet and
+I/Q receive and continuous arbitrary-I/Q transmit over Gigabit Ethernet and
 the native high-speed USB interface. SoapyESPSDR makes it available to
 applications that support SoapySDR, including Gqrx, GNU Radio, and SDR++.
 
@@ -87,9 +87,9 @@ MAC address, shown by `--find`). One combined firmware image keeps Ethernet
 and USB control available together; the most recent RX stream start owns the
 half-duplex sample engine.
 
-USB RX uses compact native `IQC8` at the selected RX rate. USB TX arms an exact-size
-device allocation, transfers packed IQ10 words in 60 KiB bulk chunks, and
-commits ownership to the replay engine without a second device-side waveform
+USB RX uses compact native `IQC8` at the selected RX rate. USB TX arms exact-size
+device allocations, transfers packed IQ10 words in 60 KiB bulk chunks, and
+queues them to the live TXDC engine without a second device-side waveform
 copy. The present implementation is validated lossless at 8 MSa/s RX; a
 16 MSa/s request reaches about 9.5 MSa/s and reports overflows/gaps, so use
 Gigabit Ethernet for lossless 16 MSa/s. Raw USB device access without root
@@ -157,7 +157,7 @@ SOAPY_SDR_PLUGIN_PATH=/home/florian/prgm/esp32/SoapyESPSDR/build gqrx
 - Signed frontend frequency correction from -100 to +100 ppm
 - Continuous complex RX at 16 MSa/s divided by an integer from 1 through 10:
   16, 8, 5.333, 4, 3.2, 2.667, 2.286, 2, 1.778, and 1.6 MSa/s
-- TX replay rates of 80, 40, 26.667, 20, 8, 6.667, 4, and 3.333 MSa/s
+- Continuous TX rates of 4 and 3.333 MSa/s
 - Automatic or manual receive gain
 - Manual receive gain from 0 to 69 dB in 1 dB steps on the tested board
 - Calibrated relative TX gain from 0 to 19.57 dB
@@ -294,20 +294,18 @@ The SoapySDR device string accepts these arguments:
 
 ## TX streaming model and limitations
 
-ESP32-S31 replay is currently a synchronous finite-burst TX path, not an
-unbounded FIFO. The Soapy layer aggregates consecutive `writeStream()` calls
-without a boundary flag, so applications may provide ordinary small buffers
-without turning every call into a separate RF/configuration burst. It flushes
-on `SOAPY_SDR_END_BURST`, `SOAPY_SDR_ONE_PACKET`, the 1,048,512-sample batch
-limit, or `deactivateStream()`. Thus one logical burst may contain 1 to
-1,048,512 complex samples. Bursts up to 16,383 samples are contiguous and have
-measured near-100% RF duty; larger bursts use up to 64 hardware replay segments
-and contain refill gaps. `SOAPY_SDR_END_BURST` also produces an `END_BURST`
-event through `readStreamStatus()`. Unflagged buffered samples are accepted
-immediately but do not reach RF until a flush boundary, which is normal FIFO
-behavior but adds up to one batch of latency. RX and TX handles may be created
-together, but simultaneous activation is rejected because the shared RF path
-is half-duplex.
+ESP-SDR uses the S31 modem's live digital TXDC input as a continuous IQ sink.
+The Soapy TX MTU is 524,288 complex samples. One full batch is retained until
+the next input arrives, so the driver knows whether to mark it as a continuation
+or as the final batch. Firmware prebuffers the first two batches and then
+applies backpressure while the real-time core consumes them. Consecutive
+`writeStream()` calls therefore form one gap-free RF stream until
+`SOAPY_SDR_END_BURST`, `SOAPY_SDR_ONE_PACKET`, or `deactivateStream()` closes
+it. Applications may submit smaller fragments; the driver aggregates them into
+the same batch. `SOAPY_SDR_END_BURST` produces an `END_BURST` event through
+`readStreamStatus()`. The lookahead adds up to one batch of host-side latency.
+RX and TX handles may be created together, but simultaneous activation is
+rejected because the shared RF path is half-duplex.
 
 For a timed burst, put `SOAPY_SDR_HAS_TIME` and the absolute hardware time on
 the first nonempty `writeStream()` fragment and place `SOAPY_SDR_END_BURST` on
@@ -323,35 +321,36 @@ clock is intentionally read-only.
 
 Bench measurements at 2.38 GHz provide useful scale for this contract:
 
-- A 16,383-sample burst measured 99.83% RF duty and about 158--163 ms
-  synchronous Ethernet `writeStream()` latency.
-- Thirty-four refined-scheduler bursts started 0.915--1.998 us after their
-  requested deadlines. This included fragmented writes, seven maximum
-  64-segment batches, and 4/80 MSa/s endpoint rates. Two HackRF captures of
-  nominal 500 ms-ahead bursts measured 28.5 dB temporal SNR and 72.9--75.7 dB
-  image rejection; firmware reported +1.000 and +1.671 us start error.
-- A later 300 ms-ahead HackRF regression started +1.225 us late with 28.5 dB
-  temporal SNR and 68.5 dB image rejection. Its companion 1 ms-ahead expiry
-  probe returned `TIME_ERROR` and saw no RF block 15 dB above the floor. A
-  subsequent just-in-time RF-rearm run started +1.177 us late with 28.78 dB
-  temporal SNR and 75.09 dB image rejection; the corresponding expiry probe
-  again emitted no detectable late burst.
-- Persistent AXI-GDMA aperture refill plus one-time source-cache publication
-  raised ten consecutive maximum 1,048,512-sample calls to 69.90--70.09% RF
-  duty (about 13.98--14.02 MSa/s effective at a nominal 20 MSa/s), with
-  individual runs reaching 71.23%, versus 62.17% / 12.43 MSa/s for CPU
-  refill. Pluto recaptured the exact maximum at 37.36 dB burst-to-noise and
-  31.33 dB image rejection. Steady-state host latency in the later ten-run
-  series was 0.322--0.327 s with no UDP error or reset.
+- Current 4 MSa/s timed bursts started 1.297 us late over Ethernet and
+  1.975 us late over USB. In the same runs, deadlines that expired during
+  staging returned `TIME_ERROR`, left zero buffered samples, and emitted no
+  late request.
+- At 4 MSa/s, 50 batches sent 26,214,400 samples in 6.553856 s versus
+  6.553600 s expected over both Ethernet and USB. Firmware reported 50
+  segments and zero boundary-gap cycles; Pluto saw all 49 seams at essentially
+  steady tone power.
+- Ten batches at 10/3 MSa/s measured 1.572864 s over Ethernet (exact at the
+  Pluto detector's 512-sample resolution) and 1.573120 s over USB, again with
+  zero boundary-gap cycles and flat seams.
+- Ethernet uses cumulative 256-datagram acknowledgements and 16-frame paced
+  flights. Its steady 2 MiB upload latency is about 130.8--131.1 ms at the
+  4 MSa/s limit, versus 131.072 ms of RF time. The sub-millisecond pacing loop
+  deliberately occupies one host core for about 97 ms per full batch.
+- The absolute 320 MHz sample scheduler preserves exact total duration, but a
+  PSRAM/cache stall can make an individual TXDC write a few microseconds late;
+  following samples catch up. This is a modulation-jitter limit even though it
+  does not create batch gaps.
 - The capture firmware now retains PARLIO across same-geometry RX/TX
-  ownership changes. Fifty consecutive maximum-size TX-to-RX cycles completed
-  with no reset or transport error and a stable 13,312-byte largest internal
-  heap block; 4/16/8/16 MSa/s geometry changes were independently lossless.
+  ownership changes. Five current RX->TX->RX cycles pass over each transport,
+  including explicit end-of-burst, deactivation flush, and rejection of
+  simultaneous activation. Final-image 16 and 4 MSa/s Ethernet and 8 MSa/s USB
+  RX regressions were lossless; the largest internal heap block remained
+  12,288 bytes after compacting status diagnostics.
 - Pluto two-tone captures measured the maximum burst at 20,000,114.8 Sa/s
   (+5.7 ppm) and separated that clock error from the roughly +18 kHz RF CFO.
-- All eight advertised TX rates were observed over the air. Pluto measured
-  37.1--38.5 dB burst-to-noise and 19.6--33.7 dB image rejection; an
-  independent HackRF capture measured 25.0 dB image rejection.
+- The older replay-aperture experiments exercised nominal rates through
+  80 MSa/s, but large changing waveforms had refill gaps. Those rates are no
+  longer advertised by SoapySDR.
 
 Other current limitations:
 
@@ -374,7 +373,8 @@ Other current limitations:
   exceeded the combined S31 PARLIO/PSRAM/GMAC path even though the raw Gigabit
   link budget was sufficient.
 - Native USB enumerates at 480 Mbit/s and is validated for Soapy control,
-  lossless 8 MSa/s RX, finite 20 MSa/s TX bursts, and repeated RX/TX switching.
+  lossless 8 MSa/s RX, continuous 4 and 3.333 MSa/s TX, and repeated RX/TX
+  switching.
   Its current endpoint path reaches about 9.5 MSa/s under a 16 MSa/s request,
   with honest overflow/gap reporting; use Ethernet for lossless 16 MSa/s.
 - On this bench, `enp0s13f0u1u1` is the host's normal internet/LAN uplink

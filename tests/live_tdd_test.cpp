@@ -68,7 +68,7 @@ int main(int argc, char **argv)
         // Use a clean control-plane rate even on hosts whose USB Ethernet
         // adapter has been degraded by simultaneous high-rate SDR traffic.
         device->setSampleRate(SOAPY_SDR_RX, 0, 4e6);
-        device->setSampleRate(SOAPY_SDR_TX, 0, 20e6);
+        device->setSampleRate(SOAPY_SDR_TX, 0, 4e6);
         device->setGain(SOAPY_SDR_TX, 0, 4);
 
         // A normal transceiver application creates both handles up front and
