@@ -1810,8 +1810,9 @@ public:
                     state->txPendingWords.size();
                 ++state->txChainSubmittedSegments;
                 const Json::Value replay = statusSnapshot()["tx_replay"];
+                const unsigned completedRateCode = txRateCode(_txSampleRate);
                 const bool tcmStaged =
-                    std::abs(_txSampleRate - 5e6) < 1000.0;
+                    completedRateCode == 14 || completedRateCode == 15;
                 const bool underflow =
                     replay.get("queue_underflow", false).asBool() ||
                     replay.get("deadline_missed", false).asBool() ||
@@ -2130,7 +2131,8 @@ private:
             4e6, 10e6 / 3.0, 2.5e6, 2e6,
         };
         static const std::vector<double> usbRates{
-            5e6, 40e6 / 9.0, 4e6, 10e6 / 3.0, 2.5e6, 2e6,
+            320e6 / 61.0, 5e6, 40e6 / 9.0, 4e6,
+            10e6 / 3.0, 2.5e6, 2e6,
         };
         return _usb ? usbRates : networkRates;
     }
@@ -2153,10 +2155,11 @@ private:
     }
     static unsigned txRateCode(const double rate)
     {
-        static const std::array<std::pair<double, unsigned>, 12> rates{{
+        static const std::array<std::pair<double, unsigned>, 13> rates{{
             {80e6, 0}, {40e6, 1}, {80e6 / 3.0, 2}, {20e6, 3},
             {8e6, 7}, {20e6 / 3.0, 8}, {4e6, 9}, {10e6 / 3.0, 10},
             {40e6 / 9.0, 11}, {2.5e6, 12}, {2e6, 13}, {5e6, 14},
+            {320e6 / 61.0, 15},
         }};
         for (const auto &entry : rates) {
             if (std::abs(rate - entry.first) < 1000.0) return entry.second;
@@ -2179,7 +2182,8 @@ private:
         putLe32(arm.data(), static_cast<uint32_t>(words.size()));
         uint16_t commitFlags = 0;
         const unsigned rateCode = txRateCode(_txSampleRate);
-        const bool packed20 = _txUdpAutostart && rateCode == 14;
+        const bool packed20 = _txUdpAutostart &&
+            (rateCode == 14 || rateCode == 15);
         if (_txUdpAutostart) {
             commitFlags = TX_UDP_FLAG_AUTOSTART |
                 static_cast<uint16_t>(rateCode << TX_UDP_RATE_CODE_SHIFT);
