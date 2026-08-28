@@ -46,6 +46,11 @@ public:
     using std::runtime_error::runtime_error;
 };
 
+class UnderflowTxError : public std::runtime_error {
+public:
+    using std::runtime_error::runtime_error;
+};
+
 enum class TxEthernetWireFormat {
     Auto,
     Iq8,
@@ -169,7 +174,7 @@ constexpr uint8_t USB_EP_CTRL_IN = 0x81;
 constexpr uint8_t USB_EP_STREAM_IN = 0x82;
 constexpr uint8_t USB_EP_TX_OUT = 0x02;
 constexpr std::size_t USB_CTRL_HEADER_BYTES = 16;
-constexpr std::size_t USB_CTRL_MAX_PAYLOAD = 2048;
+constexpr std::size_t USB_CTRL_MAX_PAYLOAD = 2304;
 constexpr unsigned USB_CTRL_TIMEOUT_MS = 3000;
 constexpr int USB_STREAM_TRANSFERS = 8;
 constexpr std::size_t USB_STREAM_TRANSFER_BYTES = 256 * 1024;
@@ -1941,6 +1946,25 @@ public:
             }
             state->txBufferedSamples = static_cast<uint32_t>(
                 state->txPendingWords.size());
+        } catch (const UnderflowTxError &error) {
+            state->txPendingWords.clear();
+            state->txBufferedSamples = 0;
+            state->txPendingHasTime = false;
+            state->txPendingStartTimeNs = 0;
+            state->txPendingActualTimeNs = 0;
+            state->txChainHasTime = false;
+            state->txChainSubmittedSamples = 0;
+            state->txChainSubmittedSegments = 0;
+            state->txHaveLastContinuationCommit = false;
+            {
+                std::lock_guard<std::mutex> lock(state->mutex);
+                state->txBurstStatuses.push_back({
+                    SOAPY_SDR_UNDERFLOW, false, 0});
+            }
+            state->condition.notify_all();
+            SoapySDR::logf(SOAPY_SDR_WARNING, "TX underflow: %s",
+                           error.what());
+            return SOAPY_SDR_UNDERFLOW;
         } catch (const TimedTxError &error) {
             /* Firmware is authoritative because a deadline can pass after
              * host validation while a large waveform is still uploading. */
@@ -2024,8 +2048,11 @@ public:
                 "tx_replay_start_error_ns",
                 "tx_replay_queue_underflow",
                 "tx_replay_deadline_missed",
-                "tx_buffered_samples", "tx_udp_errors", "usb_tx_errors",
-                "usb_tx_uploads"};
+                "tx_buffered_samples", "tx_udp_errors",
+                "tx_udp_stale_datagrams",
+                "tx_udp_backpressure_retries", "tx_udp_commit_rejections",
+                "usb_tx_errors", "usb_tx_backpressure_retries",
+                "usb_tx_commit_rejections", "usb_tx_uploads"};
     }
     SoapySDR::ArgInfo getSensorInfo(const std::string &key) const override
     {
@@ -2057,6 +2084,27 @@ public:
         } else if (key == "rx_agc_active") {
             info.name = "Software AGC active";
             info.description = "True while firmware software AGC controls receive gain";
+        } else if (key == "tx_udp_stale_datagrams") {
+            info.name = "Ethernet TX stale datagrams";
+            info.description =
+                "Structurally valid TX packets ignored after their session expired";
+            info.units = "datagrams";
+        } else if (key == "tx_udp_backpressure_retries" ||
+                   key == "usb_tx_backpressure_retries") {
+            info.name = key == "tx_udp_backpressure_retries"
+                ? "Ethernet TX backpressure retries"
+                : "USB TX backpressure retries";
+            info.description =
+                "Retryable commits deferred while the realtime TX queue was full";
+            info.units = "retries";
+        } else if (key == "tx_udp_commit_rejections" ||
+                   key == "usb_tx_commit_rejections") {
+            info.name = key == "tx_udp_commit_rejections"
+                ? "Ethernet TX commit rejections"
+                : "USB TX commit rejections";
+            info.description =
+                "Terminal replay-engine rejections, excluding ordinary backpressure";
+            info.units = "rejections";
         }
         return info;
     }
@@ -2066,7 +2114,13 @@ public:
             return std::to_string(
                 _txStream == nullptr ? 0 : _txStream->txBufferedSamples.load());
         }
-        if (key == "tx_udp_errors" || key == "usb_tx_errors" ||
+        if (key == "tx_udp_errors" ||
+            key == "tx_udp_stale_datagrams" ||
+            key == "tx_udp_backpressure_retries" ||
+            key == "tx_udp_commit_rejections" ||
+            key == "usb_tx_errors" ||
+            key == "usb_tx_backpressure_retries" ||
+            key == "usb_tx_commit_rejections" ||
             key == "usb_tx_uploads") {
             const Json::Value status = statusSnapshot();
             return std::to_string(status.get(key, 0).asUInt());
@@ -2364,13 +2418,31 @@ private:
              * synchronous libusb write has completed. Retry only this
              * explicitly transient response; every other protocol error is
              * still terminal. */
-            for (unsigned attempt = 0;; ++attempt) {
+            for (;;) {
                 try {
                     usbControl->rawRequest(USB_OP_TX_COMMIT, nullptr, 0);
                     break;
                 } catch (const std::runtime_error &error) {
-                    if (attempt >= 19 || std::string(error.what()).find(
-                            "USB TX upload is incomplete") == std::string::npos)
+                    const std::string message = error.what();
+                    const bool transient =
+                        message.find("USB TX upload is incomplete") !=
+                            std::string::npos ||
+                        message.find("USB TX replay engine is busy") !=
+                            std::string::npos;
+                    if (!transient) {
+                        if (continuation && message.find(
+                                "USB TX replay engine rejected upload") !=
+                                std::string::npos) {
+                            const Json::Value fresh = usbControl->rawRequest(
+                                USB_OP_GET_STATUS, nullptr, 0);
+                            cacheStatus(fresh);
+                            if (fresh["tx_replay"].get(
+                                    "queue_underflow", false).asBool())
+                                throw UnderflowTxError(message);
+                        }
+                        throw;
+                    }
+                    if (std::chrono::steady_clock::now() >= deadline)
                         throw;
                     std::this_thread::sleep_for(std::chrono::milliseconds(1));
                 }
@@ -2456,6 +2528,7 @@ private:
         const uint32_t token = arm["session_token"].asUInt();
         const unsigned port = arm.get("port", 50001).asUInt();
         const uint32_t beforeCommits = arm.get("commit_count", 0).asUInt();
+        const uint32_t beforeErrors = arm.get("error_count", 0).asUInt();
         if (token == 0 || words.size() > arm.get("max_words", 0).asUInt64())
             throw std::runtime_error("invalid TX UDP arm response");
 
@@ -2538,6 +2611,17 @@ private:
                 le32(ack.data() + 36) !=
                     static_cast<uint32_t>(crc32(0, ack.data(), 36))) return false;
             received = le32(ack.data() + 20);
+            if (le32(ack.data() + 28) != beforeErrors) {
+                const Json::Value fresh =
+                    _control->get("/api/v1/status");
+                cacheStatus(fresh);
+                if (continuation && fresh["tx_replay"].get(
+                        "queue_underflow", false).asBool())
+                    throw UnderflowTxError(
+                        "Ethernet TX continuation arrived after underflow");
+                throw std::runtime_error(
+                    "firmware rejected the Ethernet TX batch");
+            }
             committed = le32(ack.data() + 24) == words.size() &&
                         le32(ack.data() + 32) > beforeCommits;
             return true;
@@ -2696,6 +2780,23 @@ private:
                  * deterministic session when packet zero was the loss. */
                 resumeOffset = windowStart;
                 recovery = true;
+            }
+        }
+        if (continuation) {
+            try {
+                const Json::Value fresh =
+                    _control->get("/api/v1/status");
+                cacheStatus(fresh);
+                if (fresh["tx_replay"].get(
+                        "queue_underflow", false).asBool())
+                    throw UnderflowTxError(
+                        "Ethernet TX commit timed out after RF underflow");
+            } catch (const UnderflowTxError &) {
+                throw;
+            } catch (const std::exception &) {
+                /* Preserve the original transport timeout when control is
+                 * unavailable too; there is then no authoritative evidence
+                 * that the RF queue starved. */
             }
         }
         throw std::runtime_error("TX UDP commit timed out at " +

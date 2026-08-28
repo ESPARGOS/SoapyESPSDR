@@ -304,6 +304,9 @@ Ethernet. One full batch is retained until the next input arrives, so the
 driver knows whether to mark it as a continuation or as the final batch.
 Firmware prebuffers four USB batches or up to six high-rate Ethernet batches
 and then applies backpressure while the real-time core consumes them.
+Ethernet IQ10 uses one active plus three queued batches so its larger 20-bit
+wire allocations leave room for the following upload; this provides about
+1.26 seconds of queued continuation at 2.5 MSa/s and 1.57 seconds at 2 MSa/s.
 Consecutive `writeStream()` calls therefore form one gap-free RF stream until
 `SOAPY_SDR_END_BURST`, `SOAPY_SDR_ONE_PACKET`, or `deactivateStream()` closes
 it. Applications may submit smaller fragments; the driver aggregates them into
@@ -329,6 +332,15 @@ are never spliced into the old timeline or allowed to restart RF implicitly.
 Each later wire batch also carries a firmware-enforced continuation marker, so
 an upload that stalls past the device timeout is rejected rather than mistaken
 for the first batch of a new transmission.
+
+Soapy exposes cumulative `tx_udp_errors`, `tx_udp_stale_datagrams`,
+`tx_udp_backpressure_retries`, and `tx_udp_commit_rejections` sensors, with the
+equivalent error, retry, and rejection sensors for USB. Stale Ethernet packets
+are structurally valid recovery traffic that arrived after their token expired;
+they are observable but are not transport corruption. Backpressure is likewise
+retryable. Error and rejection deltas must remain zero for a clean stream, and
+the driver also rejects an Ethernet batch immediately when its commit ACK shows
+a new firmware error.
 
 For a timed burst, put `SOAPY_SDR_HAS_TIME` and the absolute hardware time on
 the first nonempty `writeStream()` fragment and place `SOAPY_SDR_END_BURST` on
@@ -426,6 +438,19 @@ Bench measurements at 2.38 GHz provide useful scale for this contract:
   host/network stalls terminate cleanly as underflow rather than silently
   restarting or splicing late samples. Ethernet rates at or below 2.5 MSa/s
   retain full packed-IQ10 precision.
+- With the separated counters, a 20-batch 4 MSa/s run transmitted all
+  20,966,400 samples with zero error/rejection deltas and a 34-cycle maximum
+  boundary correction. A forced two-second producer pause returned
+  `SOAPY_SDR_UNDERFLOW`, stopped the RF chain after 6,289,920 samples, and
+  likewise produced no transport error or rejection. The native-USB ceiling
+  then transmitted 10,485,760 samples at 320/61 MSa/s with zero counter deltas
+  and a 47-cycle maximum slot correction.
+- A pressure-focused 2 MSa/s IQ10 run transmitted all 20,966,400 samples while
+  transparently retrying 340 full-queue commits. Its error and rejection deltas
+  remained zero, demonstrating that backpressure is operational rather than
+  merely diagnostic. A subsequent 100-batch stress run transmitted all
+  104,832,000 samples over 52.416 seconds of RF with 69 further transparent
+  retries, zero error/rejection deltas, and a 5-cycle maximum correction.
 - The absolute 320 MHz sample scheduler preserves exact total duration, but a
   PSRAM/cache stall can make an individual TXDC write a few microseconds late;
   following samples catch up. This is a modulation-jitter limit even though it
