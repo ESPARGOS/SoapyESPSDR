@@ -668,6 +668,9 @@ struct StreamState {
     std::map<std::pair<uint32_t, uint32_t>, PendingFrame> pending;
     uint32_t epoch = 0;
     bool haveEpoch = false;
+    std::atomic<uint32_t> expectedEpoch{0};
+    std::atomic<bool> haveExpectedEpoch{false};
+    uint32_t usbCurrentEpochDatagrams = 0;
     uint32_t expectedDatagramSequence = 0;
     uint32_t lastDatagramSequence = 0;
     bool haveDatagramSequence = false;
@@ -1422,6 +1425,8 @@ public:
             state->pending.clear();
             state->overflowPending = false;
             state->haveEpoch = false;
+            state->haveExpectedEpoch.store(false, std::memory_order_release);
+            state->usbCurrentEpochDatagrams = 0;
             state->haveDatagramSequence = false;
             state->missingDatagramSequences.clear();
             state->unrecoveredDatagramGaps = 0;
@@ -1457,7 +1462,15 @@ public:
         // transports. Request the compact native-IQ framing explicitly.
         body["stream_format"] = 1;
         try {
-            _control->post("/api/v1/stream/start", body);
+            const Json::Value startStatus =
+                _control->post("/api/v1/stream/start", body);
+            if (!startStatus.isMember("stream_epoch"))
+                throw std::runtime_error(
+                    "ESP-SDR stream start response has no epoch");
+            state->expectedEpoch.store(
+                startStatus["stream_epoch"].asUInt(),
+                std::memory_order_relaxed);
+            state->haveExpectedEpoch.store(true, std::memory_order_release);
         } catch (...) {
             state->stop = true;
             state->rxWakeCondition.notify_all();
@@ -1779,12 +1792,17 @@ public:
                     state->txPendingWords.size();
                 ++state->txChainSubmittedSegments;
                 const Json::Value replay = statusSnapshot()["tx_replay"];
+                const bool tcmStaged =
+                    std::abs(_txSampleRate - 5e6) < 1000.0;
                 const bool underflow =
-                    replay.get("gap_cycles", 0).asUInt() != 0u ||
+                    replay.get("queue_underflow", false).asBool() ||
+                    replay.get("deadline_missed", false).asBool() ||
                     replay.get("words", 0).asUInt64() !=
                         state->txChainSubmittedSamples ||
-                    replay.get("segments", 0).asUInt() !=
-                        state->txChainSubmittedSegments;
+                    (!tcmStaged &&
+                     (replay.get("gap_cycles", 0).asUInt() != 0u ||
+                      replay.get("segments", 0).asUInt() !=
+                          state->txChainSubmittedSegments));
                 if (underflow) completedStatus = SOAPY_SDR_UNDERFLOW;
                 state->txPendingWords.clear();
                 state->txPendingHasTime = false;
@@ -1876,6 +1894,7 @@ public:
                 "tx_replay_requested_start_time_ns",
                 "tx_replay_actual_start_time_ns",
                 "tx_replay_start_error_ns",
+                "tx_replay_queue_underflow",
                 "tx_replay_deadline_missed",
                 "tx_buffered_samples", "tx_udp_errors", "usb_tx_errors",
                 "usb_tx_uploads"};
@@ -1887,7 +1906,8 @@ public:
         SoapySDR::ArgInfo info;
         info.key = key;
         info.name = key;
-        if (key == "tx_replay_deadline_missed" || key == "rx_agc_active") {
+        if (key == "tx_replay_deadline_missed" ||
+            key == "tx_replay_queue_underflow" || key == "rx_agc_active") {
             info.value = "false";
             info.type = SoapySDR::ArgInfo::BOOL;
         } else {
@@ -1959,6 +1979,7 @@ public:
             if (key == "tx_replay_requested_start_time_ns") return std::to_string(replay.get("requested_start_time_ns", Json::Int64(0)).asInt64());
             if (key == "tx_replay_actual_start_time_ns") return std::to_string(replay.get("actual_start_time_ns", Json::Int64(0)).asInt64());
             if (key == "tx_replay_start_error_ns") return std::to_string(replay.get("start_error_ns", Json::Int64(0)).asInt64());
+            if (key == "tx_replay_queue_underflow") return replay.get("queue_underflow", false).asBool() ? "true" : "false";
             if (key == "tx_replay_deadline_missed") return replay.get("deadline_missed", false).asBool() ? "true" : "false";
             if (key == "tx_replay_duty_ppm") {
                 const uint64_t total = replay.get("total_cycles", 0).asUInt64();
@@ -3120,6 +3141,13 @@ private:
             std::memcmp(header.frameMagic.data(), "IQC8", 4) != 0 &&
             std::memcmp(header.frameMagic.data(), "IQR8", 4) != 0 &&
             std::memcmp(header.frameMagic.data(), "IQB8", 4) != 0) return;
+        if (state->haveExpectedEpoch.load(std::memory_order_acquire) &&
+            header.epoch != state->expectedEpoch.load(
+                                std::memory_order_relaxed))
+            return;
+        if (state->usb != nullptr &&
+            state->usbCurrentEpochDatagrams < USB_STREAM_TRANSFERS)
+            state->usbCurrentEpochDatagrams++;
         if (!state->haveEpoch || state->epoch != header.epoch) {
             std::lock_guard<std::mutex> lock(state->mutex);
             state->epoch = header.epoch;
@@ -3348,6 +3376,11 @@ private:
     static void usbConsume(StreamState *state)
     {
         auto &buffer = state->usbParseBuffer;
+        /* Submit IN transfers before STREAM_START so no prefix of the first
+         * batch can be lost. Until the control response publishes the new
+         * epoch, retain whatever those transfers collect instead of letting
+         * a valid old-epoch tail establish receiver state. */
+        if (!state->haveExpectedEpoch.load(std::memory_order_acquire)) return;
         std::size_t pos = 0;
         while (buffer.size() - pos >= UDP_HEADER_BYTES) {
             const uint8_t *p = buffer.data() + pos;
@@ -3358,7 +3391,13 @@ private:
                  * transfer ahead of the new stream epoch. Discard that
                  * startup prefix while acquiring the first valid header;
                  * once epoch lock exists, retain strict corruption counts. */
-                if (state->haveEpoch) state->invalidDatagrams++;
+                /* Up to one cancelled old transfer per submitted startup URB
+                 * can complete after a valid new-epoch transfer. Suppress
+                 * only that bounded acquisition prefix; once one current
+                 * datagram per URB has arrived, every resync byte is genuine
+                 * in-stream corruption and remains strictly counted. */
+                if (state->usbCurrentEpochDatagrams >= USB_STREAM_TRANSFERS)
+                    state->invalidDatagrams++;
                 continue;
             }
             const std::size_t total = UDP_HEADER_BYTES + le16(p + 36);

@@ -360,6 +360,10 @@ Bench measurements at 2.38 GHz provide useful scale for this contract:
   52,428,800 samples in 10.48576 s with zero USB errors and aggregate timing
   176 CPU cycles from ideal. HackRF measured 62.7 dB tone-to-spectral-median,
   45.2 dB image rejection, and no clipping through the public Soapy API.
+  Soapy uses the firmware's explicit `queue_underflow` status rather than
+  treating normal TCM slot timing corrections as starvation: the full chain
+  returns clean `END_BURST`, while a forced host pause returns
+  `SOAPY_SDR_UNDERFLOW`.
   Measured TCM-slot handoff jitter reached roughly 1 us in the resource-safe
   build, so 40/9 MSa/s remains the conservative choice for especially
   phase-sensitive work.
@@ -370,6 +374,10 @@ Bench measurements at 2.38 GHz provide useful scale for this contract:
 - RX activation defaults to continuous 1/1 capture. It does not inherit the
   firmware's deliberately sparse 1/2501 idle-safe boot cadence; applications
   that want duty cycling can still pass `cycle_total` and `cycle_stream`.
+  Native USB parsing is locked to the epoch returned by `STREAM_START` and
+  discards the bounded tail of cancelled startup URBs. An immediate 8 MSa/s
+  over-the-air RX after forced 5 MSa/s TX starvation completed with zero
+  invalid packets, gaps, drops, reordering, or capture restarts.
 - Faster 68--71 cycle/sample candidates were deliberately rejected. Even
   320/69 MSa/s sent 157,286,400 stress-test samples with exact aggregate timing
   and zero transport gaps/errors, but wideband repeated-OFDM captures showed
