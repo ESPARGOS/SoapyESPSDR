@@ -66,7 +66,7 @@ On a multi-homed host, `interface=<name>` binds HTTP control and both UDP
 directions without changing system routes:
 
 ```sh
-SoapySDRUtil --probe="driver=espsdr,host=192.168.0.139,interface=enp0s13f0u1u1"
+SoapySDRUtil --probe="driver=espsdr,host=192.168.0.139,interface=wlan0"
 ```
 
 An explicit `host` always selects Ethernet even when USB is attached.
@@ -88,10 +88,10 @@ and USB control available together; the most recent RX stream start owns the
 half-duplex sample engine.
 
 USB RX uses compact native `IQC8` at the selected RX rate. USB TX arms exact-size
-device allocations, transfers packed IQ10 words in 4 KiB bulk chunks, and
+device allocations, transfers packed IQ10 words in 32 KiB bulk chunks, and
 queues them to the live TXDC engine without a second device-side waveform
-copy. Shorter OUT transactions reduce contention with the realtime PSRAM
-reader and materially improve arbitrary-waveform fidelity. The present
+copy. Larger transactions reduce endpoint-completion overhead beside the
+realtime PSRAM stager. The present
 implementation is validated lossless at 8 MSa/s RX; a
 16 MSa/s request reaches about 9.5 MSa/s and reports overflows/gaps, so use
 Gigabit Ethernet for lossless 16 MSa/s. Raw USB device access without root
@@ -298,11 +298,12 @@ The SoapySDR device string accepts these arguments:
 ## TX streaming model and limitations
 
 ESP-SDR uses the S31 modem's live digital TXDC input as a continuous IQ sink.
-The Soapy TX MTU is 524,288 complex samples. One full batch is retained until
-the next input arrives, so the driver knows whether to mark it as a continuation
-or as the final batch. Firmware prebuffers the first two batches and then
-applies backpressure while the real-time core consumes them. Consecutive
-`writeStream()` calls therefore form one gap-free RF stream until
+The Soapy TX MTU is 524,288 complex samples over native USB and 1,048,320 over
+Ethernet. One full batch is retained until the next input arrives, so the
+driver knows whether to mark it as a continuation or as the final batch.
+Firmware prebuffers four USB batches or up to six high-rate Ethernet batches
+and then applies backpressure while the real-time core consumes them.
+Consecutive `writeStream()` calls therefore form one gap-free RF stream until
 `SOAPY_SDR_END_BURST`, `SOAPY_SDR_ONE_PACKET`, or `deactivateStream()` closes
 it. Applications may submit smaller fragments; the driver aggregates them into
 the same batch. `SOAPY_SDR_END_BURST` produces an `END_BURST` event through
@@ -338,13 +339,14 @@ Bench measurements at 2.38 GHz provide useful scale for this contract:
   1.975 us late over USB. In the same runs, deadlines that expired during
   staging returned `TIME_ERROR`, left zero buffered samples, and emitted no
   late request.
-- At 4 MSa/s, 50 batches sent 26,214,400 samples in 6.553856 s versus
-  6.553600 s expected over both Ethernet and USB. Firmware reported 50
-  segments and zero boundary-gap cycles; Pluto saw all 49 seams at essentially
-  steady tone power.
-- Ten batches at 10/3 MSa/s measured 1.572864 s over Ethernet (exact at the
-  Pluto detector's 512-sample resolution) and 1.573120 s over USB, again with
-  zero boundary-gap cycles and flat seams.
+- Ethernet uses signed IQ8 transport at its 4 and 10/3 MSa/s high-rate modes;
+  firmware expands those samples to ordinary IQ10 modem words. At 4 MSa/s,
+  200 batches sent 209,664,000 samples over 52.416 s of RF with no underflow,
+  a 30-cycle maximum staging correction, and 808 cycles of total scheduler
+  error. Pluto repeated-OFDM capture measured -18.16 dB median and -17.41 dB
+  p95 differential EVM, no pair worse than -6 dB, and 0.9958 repeat coherence.
+  Two subsequent back-to-back 50-batch 10/3 MSa/s runs sent 104,832,000
+  samples without underflow, with 13- and 16-cycle maxima.
 - With ambient traffic on the shared LAN, a new 100-batch Ethernet run at
   2.5 MSa/s sent 52,428,800 samples in 20.97152 s with zero gaps, underflow,
   or transport errors; 2 MSa/s is also lossless. Pluto two-tone checks measured
@@ -356,9 +358,10 @@ Bench measurements at 2.38 GHz provide useful scale for this contract:
   USB errors. A ten-batch Soapy/Pluto capture retained all nine seams and its
   RF duration agreed within the 0.256 ms analysis-block resolution. This rate
   is intentionally absent from the Ethernet capability list.
-- Native USB also exposes a 5 MSa/s DIRAM-staged backend. It borrows the 30
-  stopped GMAC RX buffers as 368-sample scatter slots, providing 11,040
-  samples (2.208 ms) of local elasticity, and decodes four packed IQ10 words
+- Native USB also exposes a 5 MSa/s DIRAM-staged backend. It borrows the 16
+  stopped GMAC RX buffers and combines them with seven static 1,280-sample
+  slots, providing 14,848 samples of local elasticity, and decodes four packed
+  IQ10 words
   at phase 32 of every 64-cycle RF interval. A 500-batch run sent 262,144,000
   samples over 52.4288 s of RF with zero USB errors or underflow, a 47-cycle
   largest steady boundary correction, and only 558 cycles of aggregate
@@ -395,12 +398,16 @@ Bench measurements at 2.38 GHz provide useful scale for this contract:
   and zero transport gaps/errors, but wideband repeated-OFDM captures showed
   roughly ten times as many severe differential-symbol outliers as the
   72-cycle 40/9 MSa/s rate. At 68 cycles rare lateness reached 27.6 us.
-- Ethernet uses cumulative 256-datagram acknowledgements and 16-frame paced
-  flights. Soapy retains libcurl's connection cache and the firmware applies
-  `TCP_NODELAY` to TX-arm connections, reducing repeated local arm latency
-  from about 52 ms to 18--19 ms. Even so, current shared-LAN 4 MSa/s commits
-  took roughly 147--158 ms versus 131.072 ms of RF, so 2.5 MSa/s remains the
-  proven continuous Ethernet rate.
+- Ethernet uses cumulative 256-datagram acknowledgements and paced UDP. The
+  high-rate IQ8 format carries 700 complex samples per 1,400-byte payload and
+  paces every datagram; the earlier four-frame cadence had adequate mean
+  bandwidth but caused descriptor bursts and rare queue starvation. Soapy
+  retains libcurl's connection cache and firmware applies `TCP_NODELAY` to
+  TX-arm connections. The 16 MB PSRAM still bounds high-rate elasticity to
+  about 1.57 s at 4 MSa/s and 1.89 s at 10/3 MSa/s. Longer ambient
+  host/network stalls terminate cleanly as underflow rather than silently
+  restarting or splicing late samples. Ethernet rates at or below 2.5 MSa/s
+  retain full packed-IQ10 precision.
 - The absolute 320 MHz sample scheduler preserves exact total duration, but a
   PSRAM/cache stall can make an individual TXDC write a few microseconds late;
   following samples catch up. This is a modulation-jitter limit even though it
