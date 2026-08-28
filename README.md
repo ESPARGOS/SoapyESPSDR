@@ -159,7 +159,7 @@ SOAPY_SDR_PLUGIN_PATH=/home/florian/prgm/esp32/SoapyESPSDR/build gqrx
 - Signed frontend frequency correction from -100 to +100 ppm
 - Continuous complex RX at 16 MSa/s divided by an integer from 1 through 10:
   16, 8, 5.333, 4, 3.2, 2.667, 2.286, 2, 1.778, and 1.6 MSa/s
-- Continuous TX rates of 5.246 (320/61), 5, 4.444, 4, 3.333, 2.5, and
+- Continuous TX rates of 5.333 (320/60), 5, 4.444, 4, 3.333, 2.5, and
   2 MSa/s over native USB; Ethernet advertises 4, 3.333, 2.5, and 2 MSa/s
 - Automatic or manual receive gain
 - Manual receive gain from 0 to 69 dB in 1 dB steps on the tested board
@@ -402,15 +402,16 @@ Bench measurements at 2.38 GHz provide useful scale for this contract:
   `SOAPY_SDR_UNDERFLOW`.
   A final Pluto wideband run measured -18.64 dB median and -16.18 dB p95
   differential EVM, no pair worse than -6 dB, and 0.9955 repeat coherence.
-- The same staged backend exposes a separately coded 320/61 MSa/s
-  (5.245901639 MSa/s) ceiling without changing the established 5 MSa/s mode.
-  A 100-batch run sent 52,428,800 samples with no underflow or USB error,
-  maximum slot-boundary lateness of 46 cycles, and only 458 cycles of total
-  error relative to the exact 61-cycle/sample duration. A ten-batch Pluto
-  wideband run measured -11.88 dB median and -10.91 dB p95 differential EVM,
-  zero symbol pairs worse than -6 dB, 0.981 repeat coherence, and RF duration
-  within 0.196 ms of ideal. The adjacent 60-cycle point accumulated 3.09 ms
-  of monotonic lateness in only 5.24 million samples, so it is not exposed.
+- The same staged backend exposes a separately coded 320/60 MSa/s
+  (5.333333333 MSa/s) ceiling without changing the established 5 MSa/s mode.
+  Its two-sample-unrolled absolute-deadline loop amortizes the pointer and loop
+  branches that made the original generic 60-cycle experiment stretch time.
+  A 100-batch run sent 52,428,800 samples with no underflow or USB error, a
+  47-cycle maximum slot correction, and only 743 cycles of aggregate error
+  relative to the exact 60-cycle/sample duration. A ten-batch Pluto wideband
+  run measured -16.17 dB median and -14.38 dB p95 differential EVM, zero
+  symbol pairs worse than -6 dB, 0.9929 repeat coherence, and RF duration
+  within 0.192 ms of ideal.
 - `testing/soapy_tx_endurance.py` checks duration modulo the firmware's 32-bit
   cycle counter, so long staged streams cannot pass merely because every sample
   eventually drained. The 500-write 5 MSa/s result above counted every small
@@ -443,7 +444,7 @@ Bench measurements at 2.38 GHz provide useful scale for this contract:
   boundary correction. A forced two-second producer pause returned
   `SOAPY_SDR_UNDERFLOW`, stopped the RF chain after 6,289,920 samples, and
   likewise produced no transport error or rejection. The native-USB ceiling
-  then transmitted 10,485,760 samples at 320/61 MSa/s with zero counter deltas
+  then transmitted 10,485,760 samples at 320/60 MSa/s with zero counter deltas
   and a 47-cycle maximum slot correction.
 - A pressure-focused 2 MSa/s IQ10 run transmitted all 20,966,400 samples while
   transparently retrying 340 full-queue commits. Its error and rejection deltas

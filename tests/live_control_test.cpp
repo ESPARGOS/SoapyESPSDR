@@ -23,6 +23,7 @@ int main(int argc, char **argv)
     const double oldCorrection = device->getFrequencyCorrection(SOAPY_SDR_RX, 0);
     const double oldBandwidth = device->getBandwidth(SOAPY_SDR_RX, 0);
     const double oldSampleRate = device->getSampleRate(SOAPY_SDR_RX, 0);
+    const double oldTxSampleRate = device->getSampleRate(SOAPY_SDR_TX, 0);
     const double oldGain = device->getGain(SOAPY_SDR_RX, 0);
     const bool oldAgc = device->getGainMode(SOAPY_SDR_RX, 0);
     const std::string oldFilterOverride = device->readSetting("rx_filter_override");
@@ -64,6 +65,22 @@ int main(int argc, char **argv)
             if (std::abs(device->getSampleRate(SOAPY_SDR_RX, 0) - rate) > 1.0)
                 throw std::runtime_error("sample-rate readback mismatch");
         }
+        const bool usbTransport = device->getHardwareInfo().at(
+            "transport").find("USB") != std::string::npos;
+        const std::vector<double> txRates =
+            device->listSampleRates(SOAPY_SDR_TX, 0);
+        const double usbCeiling = 320e6 / 60.0;
+        const bool hasUsbCeiling = std::find_if(
+            txRates.begin(), txRates.end(), [usbCeiling](double rate) {
+                return std::abs(rate - usbCeiling) < 1.0;
+            }) != txRates.end();
+        if (hasUsbCeiling != usbTransport)
+            throw std::runtime_error("transport-specific TX ceiling mismatch");
+        for (const double rate : txRates) {
+            device->setSampleRate(SOAPY_SDR_TX, 0, rate);
+            if (std::abs(device->getSampleRate(SOAPY_SDR_TX, 0) - rate) > 1.0)
+                throw std::runtime_error("TX sample-rate readback mismatch");
+        }
         std::cout << "set calibrated TX gain\n";
         const SoapySDR::Range txGainRange =
             device->getGainRange(SOAPY_SDR_TX, 0);
@@ -92,8 +109,6 @@ int main(int argc, char **argv)
             wireInfo->options != std::vector<std::string>(
                 {"auto", "iq8", "iq10"}))
             throw std::runtime_error("TX wire-format options mismatch");
-        const bool usbTransport = device->getHardwareInfo().at(
-            "transport").find("USB") != std::string::npos;
         if (usbTransport) {
             bool usbOverrideRejected = false;
             try {
@@ -163,6 +178,7 @@ int main(int argc, char **argv)
         device->setFrequencyCorrection(SOAPY_SDR_RX, 0, oldCorrection);
         device->setBandwidth(SOAPY_SDR_RX, 0, oldBandwidth);
         device->setSampleRate(SOAPY_SDR_RX, 0, oldSampleRate);
+        device->setSampleRate(SOAPY_SDR_TX, 0, oldTxSampleRate);
         device->writeSetting("rx_filter_override", oldFilterOverride);
         device->writeSetting("tx_gain_code", oldTxGainCode);
         device->writeSetting("tx_wire_format", oldTxWireFormat);

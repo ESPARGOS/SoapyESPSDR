@@ -2293,7 +2293,7 @@ private:
             4e6, 10e6 / 3.0, 2.5e6, 2e6,
         };
         static const std::vector<double> usbRates{
-            320e6 / 61.0, 5e6, 40e6 / 9.0, 4e6,
+            320e6 / 60.0, 5e6, 40e6 / 9.0, 4e6,
             10e6 / 3.0, 2.5e6, 2e6,
         };
         return _usb ? usbRates : networkRates;
@@ -2321,7 +2321,7 @@ private:
             {80e6, 0}, {40e6, 1}, {80e6 / 3.0, 2}, {20e6, 3},
             {8e6, 7}, {20e6 / 3.0, 8}, {4e6, 9}, {10e6 / 3.0, 10},
             {40e6 / 9.0, 11}, {2.5e6, 12}, {2e6, 13}, {5e6, 14},
-            {320e6 / 61.0, 15},
+            {320e6 / 60.0, 15},
         }};
         for (const auto &entry : rates) {
             if (std::abs(rate - entry.first) < 1000.0) return entry.second;
