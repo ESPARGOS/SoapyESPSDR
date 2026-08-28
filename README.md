@@ -294,6 +294,7 @@ The SoapySDR device string accepts these arguments:
 | `cycle_total` | device state | Total chunks per duty-cycle period; an explicit argument overrides the current firmware setting. |
 | `cycle_stream` | device state | Streamed chunks per period; an explicit argument overrides the current firmware setting. |
 | `frequency_correction_ppm` | `0` | Board-specific signed oscillator correction; positive means the ESP LO runs high. |
+| `tx_wire_format` | `auto` | Ethernet TX precision policy: `auto`, forced `iq8`, or forced `iq10`; native USB always uses IQ10. |
 
 ## TX streaming model and limitations
 
@@ -310,6 +311,14 @@ the same batch. `SOAPY_SDR_END_BURST` produces an `END_BURST` event through
 `readStreamStatus()`. The lookahead adds up to one batch of host-side latency.
 RX and TX handles may be created together, but simultaneous activation is
 rejected because the shared RF path is half-duplex.
+
+The `tx_wire_format` device setting makes the Ethernet precision/robustness
+tradeoff explicit. `auto` uses signed IQ8 at 4 and 10/3 MSa/s and packed IQ10
+at 2.5 and 2 MSa/s. `iq8` and `iq10` force either negotiated codec at every
+Ethernet rate; non-auto values are rejected on native USB because USB always
+retains IQ10. The setting can also be supplied in the device arguments and
+cannot be changed while TX is active, preventing a queued RF chain from mixing
+sample representations.
 
 If the host stops supplying batches for 200 ms, the driver discards its
 retained batch and returns `SOAPY_SDR_UNDERFLOW`; the corresponding
@@ -347,6 +356,15 @@ Bench measurements at 2.38 GHz provide useful scale for this contract:
   p95 differential EVM, no pair worse than -6 dB, and 0.9958 repeat coherence.
   Two subsequent back-to-back 50-batch 10/3 MSa/s runs sent 104,832,000
   samples without underflow, with 13- and 16-cycle maxima.
+- At the normal 18,000-count OFDM source level, IQ8 wire quantization alone is
+  -37.01 dB EVM, well below the measured RF timing floor. Forced IQ8 and IQ10
+  captures at 4 MSa/s measured -17.25 and -16.74 dB median differential EVM;
+  neither had a symbol pair worse than -6 dB. At a deliberately tiny
+  300-count source level, IQ8 quantization rises to -1.95 dB. A lower-pressure
+  2.5 MSa/s Pluto comparison then measured -6.40 dB reference-symbol EVM for
+  IQ8 versus -12.46 dB for IQ10. `auto` therefore favors continuity at the
+  high rates but preserves two extra bits where they produce usable low-level
+  waveform fidelity.
 - With ambient traffic on the shared LAN, a new 100-batch Ethernet run at
   2.5 MSa/s sent 52,428,800 samples in 20.97152 s with zero gaps, underflow,
   or transport errors; 2 MSa/s is also lossless. Pluto two-tone checks measured

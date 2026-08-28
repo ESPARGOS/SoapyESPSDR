@@ -46,6 +46,31 @@ public:
     using std::runtime_error::runtime_error;
 };
 
+enum class TxEthernetWireFormat {
+    Auto,
+    Iq8,
+    Iq10,
+};
+
+TxEthernetWireFormat parseTxEthernetWireFormat(const std::string &value)
+{
+    if (value == "auto") return TxEthernetWireFormat::Auto;
+    if (value == "iq8") return TxEthernetWireFormat::Iq8;
+    if (value == "iq10") return TxEthernetWireFormat::Iq10;
+    throw std::runtime_error(
+        "tx_wire_format must be auto, iq8, or iq10");
+}
+
+const char *txEthernetWireFormatName(const TxEthernetWireFormat format)
+{
+    switch (format) {
+    case TxEthernetWireFormat::Auto: return "auto";
+    case TxEthernetWireFormat::Iq8: return "iq8";
+    case TxEthernetWireFormat::Iq10: return "iq10";
+    }
+    return "auto";
+}
+
 constexpr std::size_t UDP_HEADER_BYTES = 52;
 constexpr std::size_t IQ_HEADER_BYTES = 52;
 constexpr std::size_t IQ_SAMPLES = 1024;
@@ -819,6 +844,9 @@ public:
         _txUdpAutostart = status.get("tx_udp_autostart", false).asBool();
         _txUdpPacked16 = status.get("tx_udp_packed16", false).asBool();
         _txUdpPacked20 = status.get("tx_udp_packed20", false).asBool();
+        const auto txWireFormat = args.find("tx_wire_format");
+        if (txWireFormat != args.end())
+            setTxEthernetWireFormat(txWireFormat->second);
         const Json::Value gain = status["manual_rx_gain"];
         if (gain.isObject() && gain["unit"].asString() == "dB") {
             _gainMin = gain.get("minimum", 0.0).asDouble();
@@ -1128,6 +1156,20 @@ public:
         txGainCodeInfo.type = SoapySDR::ArgInfo::INT;
         txGainCodeInfo.range = SoapySDR::Range(0, 63, 1);
 
+        SoapySDR::ArgInfo txWireFormat;
+        txWireFormat.key = "tx_wire_format";
+        txWireFormat.value = txEthernetWireFormatName(
+            _txEthernetWireFormat);
+        txWireFormat.name = "Ethernet TX wire precision";
+        txWireFormat.description =
+            "auto uses IQ8 at 4 and 10/3 MSa/s and IQ10 at lower rates; "
+            "forced IQ8 favors transport margin, while forced IQ10 preserves "
+            "the modem's full sample precision";
+        txWireFormat.type = SoapySDR::ArgInfo::STRING;
+        txWireFormat.options = {"auto", "iq8", "iq10"};
+        txWireFormat.optionNames = {
+            "Automatic", "Signed IQ8", "Packed IQ10"};
+
         SoapySDR::ArgInfo filterOverride;
         filterOverride.key = "rx_filter_override";
         filterOverride.value = "0";
@@ -1195,7 +1237,7 @@ public:
         loopBbGain.value = "63";
         loopBbGain.name = "Diagnostic loopback BB gain";
 
-        return {total, streamed, correction, txGainCodeInfo,
+        return {total, streamed, correction, txGainCodeInfo, txWireFormat,
                 filterOverride, filterMode, filterDcap, adcSource,
                 loopback, toneEnable, toneStep, loopTxGain, loopRxGain, loopBbGain};
     }
@@ -1219,6 +1261,9 @@ public:
             patch["gain"]["tx_gain"] =
                 parseUnsigned(value, "tx_gain_code", 0, 63);
             applyPatch(patch);
+            return;
+        } else if (key == "tx_wire_format") {
+            setTxEthernetWireFormat(value);
             return;
         } else if (key == "rx_filter_override") {
             Json::Value patch;
@@ -1286,6 +1331,8 @@ public:
             getFrequencyCorrection(SOAPY_SDR_RX, 0));
         if (key == "tx_gain_code") return std::to_string(
             configUInt("gain", "tx_gain", 4));
+        if (key == "tx_wire_format") return txEthernetWireFormatName(
+            _txEthernetWireFormat);
         if (key == "rx_filter_override") return std::to_string(configUInt("rx_filter", "rx_filter_override", 0));
         if (key == "rx_filter_mode") return std::to_string(configUInt("rx_filter", "rx_filter_mode", 16));
         if (key == "rx_filter_dcap") return std::to_string(configUInt("rx_filter", "rx_filter_dcap", 60));
@@ -2382,8 +2429,12 @@ private:
         }
 
         const uint32_t rateCode = txRateCode(_txSampleRate);
+        const bool automaticIq8 =
+            _txEthernetWireFormat == TxEthernetWireFormat::Auto &&
+            (rateCode == 9 || rateCode == 10);
         const bool packed16 = _txUdpAutostart && _txUdpPacked16 &&
-                              (rateCode == 9 || rateCode == 10);
+            (_txEthernetWireFormat == TxEthernetWireFormat::Iq8 ||
+             automaticIq8);
         const bool packed20 = !packed16 && _txUdpAutostart && _txUdpPacked20;
         /* Convert before arming the short-lived firmware upload session.
          * Capability-negotiated IQ8 is used at 4 and 10/3 MSa/s because its
@@ -3612,6 +3663,30 @@ private:
         state->usbParseBuffer.clear();
     }
 
+    void setTxEthernetWireFormat(const std::string &value)
+    {
+        const TxEthernetWireFormat format =
+            parseTxEthernetWireFormat(value);
+        if (_usb != nullptr && format != TxEthernetWireFormat::Auto)
+            throw std::runtime_error(
+                "tx_wire_format applies only to Ethernet TX");
+        if (format == TxEthernetWireFormat::Iq8 && !_txUdpPacked16)
+            throw std::runtime_error(
+                "firmware does not support signed-IQ8 Ethernet TX");
+        if (format == TxEthernetWireFormat::Iq10 && !_txUdpPacked20)
+            throw std::runtime_error(
+                "firmware does not support packed-IQ10 Ethernet TX");
+        if (_txStream != nullptr) {
+            std::lock_guard<std::mutex> lock(_txStream->txWriteMutex);
+            if (_txStream->active.load())
+                throw std::runtime_error(
+                    "cannot change tx_wire_format while TX is active");
+            _txEthernetWireFormat = format;
+            return;
+        }
+        _txEthernetWireFormat = format;
+    }
+
     std::string _host;
     std::string _interface;
     unsigned _httpPort;
@@ -3637,6 +3712,8 @@ private:
     bool _txUdpAutostart = false;
     bool _txUdpPacked16 = false;
     bool _txUdpPacked20 = false;
+    TxEthernetWireFormat _txEthernetWireFormat =
+        TxEthernetWireFormat::Auto;
     StreamState *_rxStream = nullptr;
     StreamState *_txStream = nullptr;
 };

@@ -1,4 +1,5 @@
 #include <SoapySDR/Device.hpp>
+#include <SoapySDR/Formats.hpp>
 
 #include <algorithm>
 #include <cmath>
@@ -26,8 +27,10 @@ int main(int argc, char **argv)
     const bool oldAgc = device->getGainMode(SOAPY_SDR_RX, 0);
     const std::string oldFilterOverride = device->readSetting("rx_filter_override");
     const std::string oldTxGainCode = device->readSetting("tx_gain_code");
+    const std::string oldTxWireFormat = device->readSetting("tx_wire_format");
     const std::string oldCycleTotal = device->readSetting("cycle_total");
     const std::string oldCycleStream = device->readSetting("cycle_stream");
+    SoapySDR::Stream *txStream = nullptr;
     int result = 0;
     try {
         std::cout << "set frequency\n";
@@ -79,6 +82,56 @@ int main(int argc, char **argv)
         if (device->readSetting("tx_gain_code") != "8" ||
             !std::isnan(device->getGain(SOAPY_SDR_TX, 0)))
             throw std::runtime_error("expert TX gain code mismatch");
+        std::cout << "check TX wire-format policy\n";
+        const auto settingInfo = device->getSettingInfo();
+        const auto wireInfo = std::find_if(
+            settingInfo.begin(), settingInfo.end(), [](const auto &info) {
+                return info.key == "tx_wire_format";
+            });
+        if (wireInfo == settingInfo.end() ||
+            wireInfo->options != std::vector<std::string>(
+                {"auto", "iq8", "iq10"}))
+            throw std::runtime_error("TX wire-format options mismatch");
+        const bool usbTransport = device->getHardwareInfo().at(
+            "transport").find("USB") != std::string::npos;
+        if (usbTransport) {
+            bool usbOverrideRejected = false;
+            try {
+                device->writeSetting("tx_wire_format", "iq8");
+            } catch (const std::runtime_error &) {
+                usbOverrideRejected = true;
+            }
+            if (!usbOverrideRejected)
+                throw std::runtime_error(
+                    "USB accepted an Ethernet wire-format override");
+        } else {
+            for (const char *format : {"iq8", "iq10"}) {
+                device->writeSetting("tx_wire_format", format);
+                if (device->readSetting("tx_wire_format") != format)
+                    throw std::runtime_error(
+                        "TX wire-format forced readback mismatch");
+            }
+        }
+        device->writeSetting("tx_wire_format", "auto");
+        if (device->readSetting("tx_wire_format") != "auto")
+            throw std::runtime_error("TX wire-format readback mismatch");
+        txStream = device->setupStream(
+            SOAPY_SDR_TX, SOAPY_SDR_CS16, {0});
+        if (device->activateStream(txStream) != 0)
+            throw std::runtime_error("TX activation failed");
+        bool activeChangeRejected = false;
+        try {
+            device->writeSetting("tx_wire_format", "auto");
+        } catch (const std::runtime_error &) {
+            activeChangeRejected = true;
+        }
+        if (!activeChangeRejected)
+            throw std::runtime_error(
+                "active TX wire-format change was not rejected");
+        if (device->deactivateStream(txStream) != 0)
+            throw std::runtime_error("TX deactivation failed");
+        device->closeStream(txStream);
+        txStream = nullptr;
         std::cout << "check typed AGC sensors\n";
         device->setGainMode(SOAPY_SDR_RX, 0, true);
         if (device->readSensor("rx_agc_active") != "true")
@@ -96,6 +149,15 @@ int main(int argc, char **argv)
         std::cerr << error.what() << '\n';
         result = 1;
     }
+    if (txStream != nullptr) {
+        try {
+            device->deactivateStream(txStream);
+            device->closeStream(txStream);
+        } catch (const std::exception &error) {
+            std::cerr << "TX stream cleanup failed: " << error.what() << '\n';
+            result = 1;
+        }
+    }
     try {
         device->setFrequency(SOAPY_SDR_RX, 0, oldFrequency);
         device->setFrequencyCorrection(SOAPY_SDR_RX, 0, oldCorrection);
@@ -103,6 +165,7 @@ int main(int argc, char **argv)
         device->setSampleRate(SOAPY_SDR_RX, 0, oldSampleRate);
         device->writeSetting("rx_filter_override", oldFilterOverride);
         device->writeSetting("tx_gain_code", oldTxGainCode);
+        device->writeSetting("tx_wire_format", oldTxWireFormat);
         device->setGain(SOAPY_SDR_RX, 0, oldGain);
         device->setGainMode(SOAPY_SDR_RX, 0, oldAgc);
         device->writeSetting("cycle_total", oldCycleTotal);
