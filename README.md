@@ -15,6 +15,10 @@ firmware's vendor control and bulk-IQ endpoints. It checks firmware and
 transport sequence numbers and reports any missing samples as SoapySDR
 overflow events.
 
+The driver and firmware are one current protocol pair. No older combination
+was published, so this checkpoint deliberately omits fallbacks for the
+experimental pre-autostart TX protocol and its status capability flags.
+
 ![ESP-SDR receiving the 2.4 GHz band in Gqrx](assets/gqrx-esp-sdr.png)
 
 *ESP-SDR receiving the 2.4 GHz band in Gqrx.*
@@ -377,12 +381,15 @@ Bench measurements at 2.38 GHz provide useful scale for this contract:
   late request.
 - Ethernet uses signed IQ8 transport at its 4 and 10/3 MSa/s high-rate modes;
   firmware expands those samples to ordinary IQ10 modem words. At 4 MSa/s,
-  200 batches sent 209,664,000 samples over 52.416 s of RF with no underflow,
-  a 30-cycle maximum staging correction, and 808 cycles of total scheduler
-  error. Pluto repeated-OFDM capture measured -18.16 dB median and -17.41 dB
-  p95 differential EVM, no pair worse than -6 dB, and 0.9958 repeat coherence.
-  Two subsequent back-to-back 50-batch 10/3 MSa/s runs sent 104,832,000
-  samples without underflow, with 13- and 16-cycle maxima.
+  the current selective-recovery uploader sent 100 batches (104,832,000
+  samples, 26.208 s RF duration) with exact accounting and zero underflow,
+  malformed packets, stale datagrams, or rejected commits. It absorbed a
+  1.70 s worst host write. A 50-batch 10/3 MSa/s run was likewise
+  transport-clean. The worst RF staging corrections were 433 and 337 CPU
+  cycles respectively, so source continuity is validated but sample-perfect
+  timing is not claimed. Pluto repeated-OFDM capture measured -18.16 dB median
+  and -17.41 dB p95 differential EVM, no pair worse than -6 dB, and 0.9958
+  repeat coherence.
 - At the normal 18,000-count OFDM source level, IQ8 wire quantization alone is
   -37.01 dB EVM, well below the measured RF timing floor. Forced IQ8 and IQ10
   captures at 4 MSa/s measured -17.25 and -16.74 dB median differential EVM;
@@ -444,16 +451,17 @@ Bench measurements at 2.38 GHz provide useful scale for this contract:
   and zero transport gaps/errors, but wideband repeated-OFDM captures showed
   roughly ten times as many severe differential-symbol outliers as the
   72-cycle 40/9 MSa/s rate. At 68 cycles rare lateness reached 27.6 us.
-- Ethernet uses cumulative 256-datagram acknowledgements and paced UDP. The
-  high-rate IQ8 format carries 700 complex samples per 1,400-byte payload and
-  paces every datagram; the earlier four-frame cadence had adequate mean
-  bandwidth but caused descriptor bursts and rare queue starvation. Soapy
-  retains libcurl's connection cache and firmware applies `TCP_NODELAY` to
-  TX-arm connections. The 16 MB PSRAM still bounds high-rate elasticity to
-  about 1.57 s at 4 MSa/s and 1.89 s at 10/3 MSa/s. Longer ambient
-  host/network stalls terminate cleanly as underflow rather than silently
-  restarting or splicing late samples. Ethernet rates at or below 2.5 MSa/s
-  retain full packed-IQ10 precision.
+- Ethernet sends a smooth full-batch UDP flight, requests cumulative progress
+  every 128 datagrams, and repairs one missing datagram at a time. The
+  firmware's bitmap retains later packets, avoiding the stale-traffic storm
+  caused by replaying the complete tail after one loss. The high-rate IQ8
+  format carries 700 complex samples per 1,400-byte payload. Soapy retains
+  libcurl's connection cache and firmware applies `TCP_NODELAY` to TX-arm
+  connections. The 16 MB PSRAM still bounds high-rate elasticity to about
+  1.57 s at 4 MSa/s and 1.89 s at 10/3 MSa/s. Longer ambient host/network
+  stalls terminate cleanly as underflow rather than silently restarting or
+  splicing late samples. Ethernet rates at or below 2.5 MSa/s retain full
+  packed-IQ10 precision.
 - With the separated counters, a 20-batch 4 MSa/s run transmitted all
   20,966,400 samples with zero error/rejection deltas and a 34-cycle maximum
   boundary correction. A forced two-second producer pause returned

@@ -111,7 +111,7 @@ constexpr std::size_t TX_UDP_ACK_BYTES = 40;
 constexpr std::size_t TX_UDP_WORDS_PER_DATAGRAM = 350;
 constexpr std::size_t TX_UDP_PACKED20_WORDS_PER_DATAGRAM = 560;
 constexpr std::size_t TX_UDP_PACKED16_WORDS_PER_DATAGRAM = 700;
-constexpr std::size_t TX_UDP_ACK_WINDOW_DATAGRAMS = 256;
+constexpr std::size_t TX_UDP_ACK_CHECKPOINT_DATAGRAMS = 128;
 constexpr std::size_t TX_UDP_PACING_BURST_DATAGRAMS = 16;
 constexpr std::size_t TX_REPLAY_SEGMENT_SAMPLES = 16383;
 constexpr std::size_t TX_REPLAY_MAX_SAMPLES = TX_REPLAY_SEGMENT_SAMPLES * 64;
@@ -871,9 +871,6 @@ public:
             _hardwareTimeHostAnchorNs = _statusRefreshNs;
             _haveHardwareTime = true;
         }
-        _txUdpAutostart = status.get("tx_udp_autostart", false).asBool();
-        _txUdpPacked16 = status.get("tx_udp_packed16", false).asBool();
-        _txUdpPacked20 = status.get("tx_udp_packed20", false).asBool();
         const auto txWireFormat = args.find("tx_wire_format");
         if (txWireFormat != args.end())
             setTxEthernetWireFormat(txWireFormat->second);
@@ -1591,7 +1588,6 @@ public:
             return 0;
         }
         Json::Value patch;
-        patch["stream"]["output_mode"] = 0;
         patch["stream"]["stream_wifi_packets"] = 0;
         patch["trigger"]["trigger_mode"] = 0;
         /* Select the production native-IQ route. The legacy expert-mode 62
@@ -2026,8 +2022,7 @@ public:
                 const unsigned completedRateCode = txRateCode(_txSampleRate);
                 const bool tcmStaged =
                     completedRateCode == 14 || completedRateCode == 15 ||
-                    (_usb == nullptr &&
-                     (_txUdpPacked16 || _txUdpPacked20));
+                    _usb == nullptr;
                 const bool underflow =
                     replay.get("queue_underflow", false).asBool() ||
                     replay.get("deadline_missed", false).asBool() ||
@@ -2488,15 +2483,12 @@ private:
         putLe32(arm.data(), static_cast<uint32_t>(words.size()));
         uint16_t commitFlags = 0;
         const unsigned rateCode = txRateCode(_txSampleRate);
-        const bool packed20 = _txUdpAutostart &&
-            (rateCode == 14 || rateCode == 15);
-        if (_txUdpAutostart) {
-            commitFlags = TX_UDP_FLAG_AUTOSTART |
-                static_cast<uint16_t>(rateCode << TX_UDP_RATE_CODE_SHIFT);
-            if (more) commitFlags |= TX_UDP_FLAG_MORE;
-            if (continuation) commitFlags |= TX_UDP_FLAG_CONTINUE;
-            if (packed20) commitFlags |= TX_FLAG_PACKED20;
-        }
+        const bool packed20 = rateCode == 14 || rateCode == 15;
+        commitFlags = TX_UDP_FLAG_AUTOSTART |
+            static_cast<uint16_t>(rateCode << TX_UDP_RATE_CODE_SHIFT);
+        if (more) commitFlags |= TX_UDP_FLAG_MORE;
+        if (continuation) commitFlags |= TX_UDP_FLAG_CONTINUE;
+        if (packed20) commitFlags |= TX_FLAG_PACKED20;
         putLe16(arm.data() + 4, commitFlags);
         putLe64(arm.data() + 8, static_cast<uint64_t>(startTimeNs));
 
@@ -2593,31 +2585,29 @@ private:
             }
             armed = false;
 
-            if (_txUdpAutostart) {
-                if (more) return 0;
-                while (std::chrono::steady_clock::now() < deadline) {
-                    const Json::Value status =
-                        _control->get("/api/v1/status");
-                    cacheStatus(status);
-                    const Json::Value replay = status["tx_replay"];
-                    const long long requested = replay.get(
-                        "requested_start_time_ns", Json::Int64(0)).asInt64();
-                    if (!status.get("config_applying", false).asBool() &&
-                        (startTimeNs == 0 || requested == startTimeNs)) {
-                        const long long actual = replay.get(
-                            "actual_start_time_ns", Json::Int64(0)).asInt64();
-                        if (startTimeNs != 0 &&
-                            (actual == 0 || replay.get(
-                                "deadline_missed", false).asBool()))
-                            throw TimedTxError(
-                                "deadline passed during USB waveform staging");
-                        return actual;
-                    }
-                    std::this_thread::sleep_for(std::chrono::milliseconds(25));
+            if (more) return 0;
+            while (std::chrono::steady_clock::now() < deadline) {
+                const Json::Value status =
+                    _control->get("/api/v1/status");
+                cacheStatus(status);
+                const Json::Value replay = status["tx_replay"];
+                const long long requested = replay.get(
+                    "requested_start_time_ns", Json::Int64(0)).asInt64();
+                if (!status.get("config_applying", false).asBool() &&
+                    (startTimeNs == 0 || requested == startTimeNs)) {
+                    const long long actual = replay.get(
+                        "actual_start_time_ns", Json::Int64(0)).asInt64();
+                    if (startTimeNs != 0 &&
+                        (actual == 0 || replay.get(
+                            "deadline_missed", false).asBool()))
+                        throw TimedTxError(
+                            "deadline passed during USB waveform staging");
+                    return actual;
                 }
-                throw std::runtime_error(
-                    "timed out waiting for USB TX replay completion");
+                std::this_thread::sleep_for(std::chrono::milliseconds(25));
             }
+            throw std::runtime_error(
+                "timed out waiting for USB TX replay completion");
         } catch (...) {
             if (armed) {
                 try {
@@ -2648,10 +2638,10 @@ private:
         const bool automaticIq8 =
             _txEthernetWireFormat == TxEthernetWireFormat::Auto &&
             (rateCode == 9 || rateCode == 10);
-        const bool packed16 = _txUdpAutostart && _txUdpPacked16 &&
+        const bool packed16 =
             (_txEthernetWireFormat == TxEthernetWireFormat::Iq8 ||
              automaticIq8);
-        const bool packed20 = !packed16 && _txUdpAutostart && _txUdpPacked20;
+        const bool packed20 = !packed16;
         /* Convert before arming the short-lived firmware upload session.
          * Capability-negotiated IQ8 is used at 4 and 10/3 MSa/s because its
          * 20% wire and packet-count reduction creates continuity margin on
@@ -2739,40 +2729,60 @@ private:
         const std::size_t flightDatagrams =
             packed16 || packed20 ? 1 : TX_UDP_PACING_BURST_DATAGRAMS;
         std::size_t resumeOffset = 0;
+        bool firmwareStateKnown = false;
 
         auto receiveAck = [&](int waitMs, std::size_t &received,
                               bool &committed) -> bool {
-            pollfd descriptor{socketFd, POLLIN, 0};
-            if (::poll(&descriptor, 1, waitMs) <= 0) return false;
-            std::array<uint8_t, TX_UDP_ACK_BYTES> ack{};
-            const ssize_t bytes = ::recv(socketFd, ack.data(), ack.size(), 0);
-            if (bytes != static_cast<ssize_t>(ack.size()) ||
-                std::memcmp(ack.data(), "IQA1", 4) != 0 ||
-                le16(ack.data() + 4) != 1 ||
-                le16(ack.data() + 6) != TX_UDP_ACK_BYTES ||
-                le32(ack.data() + 8) != token ||
-                le32(ack.data() + 12) != batch ||
-                le32(ack.data() + 36) !=
-                    static_cast<uint32_t>(crc32(0, ack.data(), 36))) return false;
-            received = le32(ack.data() + 20);
-            if (le32(ack.data() + 28) != beforeErrors) {
-                const Json::Value fresh =
-                    _control->get("/api/v1/status");
-                cacheStatus(fresh);
-                if (continuation && fresh["tx_replay"].get(
-                        "queue_underflow", false).asBool())
-                    throw UnderflowTxError(
-                        "Ethernet TX continuation arrived after underflow");
-                throw std::runtime_error(
-                    "firmware rejected the Ethernet TX batch");
+            const auto ackDeadline = std::chrono::steady_clock::now() +
+                std::chrono::milliseconds(waitMs);
+            bool valid = false;
+            while (true) {
+                const auto now = std::chrono::steady_clock::now();
+                const int remainingMs = static_cast<int>(
+                    std::max<int64_t>(0,
+                        std::chrono::duration_cast<std::chrono::milliseconds>(
+                            ackDeadline - now).count()));
+                pollfd descriptor{socketFd, POLLIN, 0};
+                if (::poll(&descriptor, 1, remainingMs) <= 0) break;
+                do {
+                    std::array<uint8_t, TX_UDP_ACK_BYTES> ack{};
+                    const ssize_t bytes = ::recv(
+                        socketFd, ack.data(), ack.size(), MSG_DONTWAIT);
+                    if (bytes < 0) break;
+                    if (bytes != static_cast<ssize_t>(ack.size()) ||
+                        std::memcmp(ack.data(), "IQA1", 4) != 0 ||
+                        le16(ack.data() + 4) != 1 ||
+                        le16(ack.data() + 6) != TX_UDP_ACK_BYTES ||
+                        le32(ack.data() + 8) != token ||
+                        le32(ack.data() + 12) != batch ||
+                        le32(ack.data() + 36) != static_cast<uint32_t>(
+                            crc32(0, ack.data(), 36))) continue;
+                    valid = true;
+                    received = std::max<std::size_t>(
+                        received, le32(ack.data() + 20));
+                    if (le32(ack.data() + 28) != beforeErrors) {
+                        const Json::Value fresh =
+                            _control->get("/api/v1/status");
+                        cacheStatus(fresh);
+                        if (continuation && fresh["tx_replay"].get(
+                                "queue_underflow", false).asBool())
+                            throw UnderflowTxError(
+                                "Ethernet TX continuation arrived after underflow");
+                        throw std::runtime_error(
+                            "firmware rejected the Ethernet TX batch");
+                    }
+                    committed = committed ||
+                        (le32(ack.data() + 24) == words.size() &&
+                         le32(ack.data() + 32) > beforeCommits);
+                } while (::poll(&descriptor, 1, 0) > 0);
+                if (committed ||
+                    std::chrono::steady_clock::now() >= ackDeadline) break;
             }
-            committed = le32(ack.data() + 24) == words.size() &&
-                        le32(ack.data() + 32) > beforeCommits;
-            return true;
+            return valid;
         };
 
         auto finishCommitted = [&]() -> long long {
-            if (!_txUdpAutostart || more) return 0;
+            if (more) return 0;
             /* The commit ACK means ownership and the replay request were
              * accepted. Wait until the queued replay has completed so an
              * immediate deactivate cannot overwrite that request. */
@@ -2806,9 +2816,8 @@ private:
             const std::size_t windowStart = resumeOffset;
             const std::size_t windowEnd = std::min(
                 words.size(), windowStart +
-                    TX_UDP_ACK_WINDOW_DATAGRAMS *
-                    samplesPerDatagram);
-            const bool reset = windowStart == 0;
+                    (recovery ? samplesPerDatagram : words.size()));
+            const bool reset = !recovery && windowStart == 0;
             auto pacingDeadline = std::chrono::steady_clock::now();
             for (std::size_t offset = windowStart; offset < windowEnd;
                  offset += samplesPerDatagram) {
@@ -2816,6 +2825,11 @@ private:
                     samplesPerDatagram, words.size() - offset);
                 const bool final = offset + count == words.size();
                 const bool windowFinal = offset + count >= windowEnd;
+                const std::size_t datagramSequence =
+                    offset / samplesPerDatagram;
+                const bool ackCheckpoint = windowFinal ||
+                    (datagramSequence + 1) %
+                        TX_UDP_ACK_CHECKPOINT_DATAGRAMS == 0;
                 std::memcpy(packet.data(), "IQT1", 4);
                 putLe16(packet.data() + 4, 1);
                 putLe16(packet.data() + 6, TX_UDP_HEADER_BYTES);
@@ -2827,10 +2841,10 @@ private:
                 putLe16(packet.data() + 24, static_cast<uint16_t>(count));
                 uint16_t packetFlags = (reset && offset == 0 ? 1u : 0u) |
                                        (final ? 2u : 0u) |
-                                       (windowFinal ? 4u : 0u) |
+                                       (ackCheckpoint ? 4u : 0u) |
                                        (packed16 ? TX_FLAG_PACKED16 : 0u) |
                                        (packed20 ? TX_FLAG_PACKED20 : 0u);
-                if (final && _txUdpAutostart) {
+                if (final) {
                     packetFlags |= TX_UDP_FLAG_AUTOSTART |
                         static_cast<uint16_t>(txRateCode(_txSampleRate)
                                               << TX_UDP_RATE_CODE_SHIFT);
@@ -2867,14 +2881,20 @@ private:
                     throw std::runtime_error("TX UDP send failed");
                 // The S31 raw-Ethernet receive path can sustain the stream rate,
                 // but a 50 us burst cadence can overrun its descriptor queue.
-                // The direct ring-drain firmware sustains 16-frame flights at
-                // a 65 us mean cadence (about 21.5 MB/s payload), leaving the
-                // control/allocation margin needed by a 16 MB/s IQ stream.
+                // On a shared interface, a 65 us cadence provokes enough GMAC
+                // descriptor loss and cumulative-window recovery to reduce
+                // useful throughput. A smooth 120 us cadence still carries
+                // 11.7 MB/s of payload (versus 8 MB/s for 4 MSa/s IQ8) while
+                // leaving control, allocation, and ambient-traffic margin.
+                // Rebase after a late host wake: replaying elapsed deadlines
+                // as a catch-up burst defeats the per-datagram smoothing.
                 // Do not use sleep_until() for this sub-millisecond deadline:
                 // scheduler wake-up latency accumulated once per Ethernet frame
                 // reduces an otherwise lossless 2 MiB upload to well below the
                 // radio sample rate on a normal desktop kernel.
-                pacingDeadline += std::chrono::microseconds(recovery ? 75 : 65);
+                const auto pacingNow = std::chrono::steady_clock::now();
+                if (pacingNow > pacingDeadline) pacingDeadline = pacingNow;
+                pacingDeadline += std::chrono::microseconds(recovery ? 140 : 120);
                 const std::size_t flightPacket =
                     (offset - windowStart) / samplesPerDatagram + 1;
                 if (flightPacket % flightDatagrams == 0 ||
@@ -2892,38 +2912,39 @@ private:
             const int remainingMs = static_cast<int>(std::max<int64_t>(
                 1, std::chrono::duration_cast<std::chrono::milliseconds>(
                        deadline - std::chrono::steady_clock::now()).count()));
-            if (receiveAck(std::min(remainingMs, 25), received, committed)) {
+            if (receiveAck(std::min(remainingMs, 100), received, committed)) {
+                firmwareStateKnown = true;
                 if (committed) return finishCommitted();
-                if (received >= windowEnd) {
-                    if (windowEnd == words.size()) {
-                        /* All payload can arrive while the realtime chain's
-                         * single continuation slot is still occupied. The
-                         * firmware ACKs the complete bitmap with committed=0;
-                         * replay the idempotent final datagram until its
-                         * try-commit handoff succeeds. */
-                        resumeOffset =
-                            ((words.size() - 1) /
-                             samplesPerDatagram) * samplesPerDatagram;
-                        recovery = true;
-                        std::this_thread::sleep_for(
-                            std::chrono::milliseconds(1));
-                    } else {
-                        resumeOffset = windowEnd;
-                        recovery = false;
-                    }
+                if (received >= words.size()) {
+                    /* All payload can arrive while the realtime chain's
+                     * continuation FIFO is still full. The firmware ACKs the
+                     * complete bitmap with committed=0; replay the idempotent
+                     * final datagram until its try-commit handoff succeeds. */
+                    resumeOffset =
+                        ((words.size() - 1) /
+                         samplesPerDatagram) * samplesPerDatagram;
+                    recovery = true;
+                    std::this_thread::sleep_for(
+                        std::chrono::milliseconds(1));
+                    continue;
+                }
+                if (received % samplesPerDatagram == 0) {
+                    /* The firmware retains the full receive bitmap, so one
+                     * missing datagram can advance the cumulative pointer by
+                     * an arbitrary distance. Repair exactly that hole and ask
+                     * for another ACK instead of replaying the already stored
+                     * tail into a session that may commit underneath it. */
+                    resumeOffset = received;
+                    recovery = true;
                     continue;
                 }
             }
-            if (received < windowEnd &&
-                received % samplesPerDatagram == 0) {
-                resumeOffset = received;
-                recovery = true;
-            } else {
-                /* A cumulative ACK can itself be lost. Replaying only this
-                 * bounded window is cheap; its RESET bit also restores a
-                 * deterministic session when packet zero was the loss. */
+            if (!firmwareStateKnown) {
+                /* If every checkpoint ACK was lost, restart the complete
+                 * batch with RESET. Once any valid ACK has established the
+                 * firmware state, retry only the same idempotent hole. */
                 resumeOffset = windowStart;
-                recovery = true;
+                recovery = windowStart != 0;
             }
         }
         if (continuation) {
@@ -2953,22 +2974,8 @@ private:
                               const bool more,
                               const bool continuation)
     {
-        if (more && !_txUdpAutostart)
-            throw std::runtime_error(
-                "continuous TX requires firmware autostart support");
-        const long long actualTimeNs =
-            uploadTxWords(words, timeoutUs, startTimeNs, more,
-                          continuation);
-        if (_txUdpAutostart) return actualTimeNs;
-        Json::Value start;
-        start["tx"]["tx_tone0_step"] =
-            (txRateCode(_txSampleRate) << 4) | 3u | (1u << 8);
-        start["tx"]["tx_tone_enable"] = 2;
-        applyPatch(start);
-        Json::Value stop;
-        stop["tx"]["tx_tone_enable"] = 0;
-        applyPatch(stop);
-        return 0;
+        return uploadTxWords(words, timeoutUs, startTimeNs, more,
+                             continuation);
     }
     void applyDutyCycle(unsigned total, unsigned streamed)
     {
@@ -3035,11 +3042,13 @@ private:
         try {
             _control->put("/api/v1/config", patch);
             const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+            Json::Value lastApplied;
             while (std::chrono::steady_clock::now() < deadline) {
                 const Json::Value status = _control->get("/api/v1/status");
                 cacheStatus(status);
                 if (!status.get("config_applying", false).asBool()) {
                     Json::Value applied = _control->get("/api/v1/config");
+                    lastApplied = applied;
                     if (jsonContains(applied, patch)) {
                         std::lock_guard<std::mutex> lock(_configMutex);
                         _config = std::move(applied);
@@ -3052,7 +3061,9 @@ private:
                 }
                 std::this_thread::sleep_for(std::chrono::milliseconds(50));
             }
-            throw std::runtime_error("timed out waiting for ESP-SDR configuration");
+            throw std::runtime_error(
+                "timed out waiting for ESP-SDR configuration: requested=" +
+                jsonString(patch) + ", applied=" + jsonString(lastApplied));
         } catch (...) {
             if (active) stream->suppressContinuityUntilNs = 0;
             throw;
@@ -4020,12 +4031,6 @@ private:
         if (_usb != nullptr && format != TxEthernetWireFormat::Auto)
             throw std::runtime_error(
                 "tx_wire_format applies only to Ethernet TX");
-        if (format == TxEthernetWireFormat::Iq8 && !_txUdpPacked16)
-            throw std::runtime_error(
-                "firmware does not support signed-IQ8 Ethernet TX");
-        if (format == TxEthernetWireFormat::Iq10 && !_txUdpPacked20)
-            throw std::runtime_error(
-                "firmware does not support packed-IQ10 Ethernet TX");
         if (_txStream != nullptr) {
             std::lock_guard<std::mutex> lock(_txStream->txWriteMutex);
             if (_txStream->active.load())
@@ -4059,9 +4064,6 @@ private:
     double _gainMax = 76.0;
     double _gainStep = 1.0;
     double _txSampleRate = 4e6;
-    bool _txUdpAutostart = false;
-    bool _txUdpPacked16 = false;
-    bool _txUdpPacked20 = false;
     TxEthernetWireFormat _txEthernetWireFormat =
         TxEthernetWireFormat::Auto;
     StreamState *_rxStream = nullptr;
