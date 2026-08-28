@@ -98,8 +98,12 @@ constexpr std::size_t MAX_QUEUE_BLOCKS = 4096;
 constexpr uint32_t UDP_VERSION = 1;
 constexpr uint32_t IQ_FLAG_TIMESTAMP_US32 = 1u << 31;
 constexpr uint32_t IQ_FLAG_SOFTWARE_AGC_ACTIVE = 1u << 30;
+constexpr uint32_t IQ_FLAG_DCOC_ACTIVE = 1u << 29;
+constexpr unsigned IQ_DCOC_ERROR_I_SHIFT = 4;
+constexpr unsigned IQ_DCOC_ERROR_Q_SHIFT = 16;
+constexpr uint32_t IQ_DCOC_ERROR_MASK = 0xfffu;
 constexpr unsigned IQ_AGC_ROBUST_PEAK_SHIFT = 20;
-constexpr uint32_t IQ_AGC_ROBUST_PEAK_MASK = 0x3ffu;
+constexpr uint32_t IQ_AGC_ROBUST_PEAK_MASK = 0x1ffu;
 constexpr unsigned IQ_AGC_GAIN_CHANGES_SHIFT = 4;
 constexpr uint32_t IQ_AGC_GAIN_CHANGES_MASK = 0xffffu;
 constexpr std::size_t TX_UDP_HEADER_BYTES = 36;
@@ -806,6 +810,13 @@ struct StreamState {
     // status traffic competing with full-rate Ethernet samples.
     std::atomic<bool> haveRxTelemetry{false};
     std::atomic<bool> rxSoftwareAgcActive{false};
+    std::atomic<bool> rxDcOffsetTrackingActive{false};
+    std::atomic<int32_t> rxDcOffsetErrorI{0};
+    std::atomic<int32_t> rxDcOffsetErrorQ{0};
+    std::atomic<bool> digitalDcCorrection{true};
+    double dcEstimateI = 0.0;
+    double dcEstimateQ = 0.0;
+    bool dcEstimateInitialized = false;
     std::atomic<uint32_t> rxGain{0};
     std::atomic<uint32_t> rxAgcRobustPeak{0};
     std::atomic<uint32_t> rxAgcGainChanges{0};
@@ -947,6 +958,42 @@ public:
     {
         checkChannel(direction, channel);
         return "RF";
+    }
+    bool hasDCOffsetMode(const int direction,
+                         const std::size_t channel) const override
+    {
+        checkChannel(direction, channel);
+        return direction == SOAPY_SDR_RX;
+    }
+    void setDCOffsetMode(const int direction, const std::size_t channel,
+                         const bool automatic) override
+    {
+        checkChannel(direction, channel);
+        if (direction == SOAPY_SDR_TX) {
+            if (automatic)
+                throw std::runtime_error(
+                    "TX DC-offset correction is not available");
+            return;
+        }
+        Json::Value patch;
+        patch["dc_offset"]["automatic"] = automatic ? 1 : 0;
+        applyPatch(patch);
+        if (_rxStream != nullptr) {
+            std::lock_guard<std::mutex> lock(_rxStream->mutex);
+            _rxStream->digitalDcCorrection = automatic;
+            _rxStream->dcEstimateI = 0.0;
+            _rxStream->dcEstimateQ = 0.0;
+            _rxStream->dcEstimateInitialized = false;
+            _rxStream->rxDcOffsetErrorI = 0;
+            _rxStream->rxDcOffsetErrorQ = 0;
+        }
+    }
+    bool getDCOffsetMode(const int direction,
+                         const std::size_t channel) const override
+    {
+        checkChannel(direction, channel);
+        if (direction == SOAPY_SDR_TX) return false;
+        return configUInt("dc_offset", "automatic", 1) != 0;
     }
     bool hasGainMode(const int direction, const std::size_t channel) const override
     {
@@ -1559,6 +1606,7 @@ public:
         state->cycleStream = streamed;
         const uint64_t timestampReferenceUs = hasHardwareTime()
             ? static_cast<uint64_t>(getHardwareTime() / 1000) : 0u;
+        const bool automaticDc = getDCOffsetMode(SOAPY_SDR_RX, 0);
         {
             std::lock_guard<std::mutex> lock(state->mutex);
             state->queue.clear();
@@ -1577,6 +1625,13 @@ public:
             state->haveFirmwareDropped = false;
             state->haveMinimumFrameSequence = false;
             state->haveRxTelemetry = false;
+            state->rxDcOffsetTrackingActive = false;
+            state->rxDcOffsetErrorI = 0;
+            state->rxDcOffsetErrorQ = 0;
+            state->digitalDcCorrection = automaticDc;
+            state->dcEstimateI = 0.0;
+            state->dcEstimateQ = 0.0;
+            state->dcEstimateInitialized = false;
             resetRealDsp(state);
         }
         if (state->usb != nullptr) {
@@ -1596,9 +1651,6 @@ public:
             state->rxDatagramRing.resize(RX_DATAGRAM_RING_SIZE);
             state->rxDatagramHead = 0;
             state->rxDatagramTail = 0;
-            state->decoderWorker =
-                std::thread(&EspDevice::decodeLoop, state);
-            state->worker = std::thread(&EspDevice::receiveLoop, state);
         }
         Json::Value body;
         body["port"] = state->port;
@@ -1620,17 +1672,21 @@ public:
                 startStatus["stream_epoch"].asUInt(),
                 std::memory_order_relaxed);
             state->haveExpectedEpoch.store(true, std::memory_order_release);
-            /* Do not overlap the synchronous STREAM_START control request
-             * with a synchronous bulk read on the same libusb context.  On
-             * Linux that leaves the subsequent reads paced at roughly one
-             * scheduler tick and starves the device's three batch slots.
-             * Starting the dedicated reader immediately after the response
-             * matches the lossless low-level client. */
+            /* Start either transport reader only after publishing the new
+             * epoch.  Besides avoiding a synchronous libusb control/bulk
+             * overlap, this prevents UDP datagrams queued in a reused socket
+             * from the previous session being accepted while the expected
+             * epoch is temporarily unknown.  The firmware's 100 ms arm delay
+             * leaves ample time to start both Ethernet workers here. */
             if (state->usb != nullptr) {
                 state->decoderWorker =
                     std::thread(&EspDevice::usbDecodeLoop, state);
                 state->worker =
                     std::thread(&EspDevice::usbReceiveLoop, state);
+            } else {
+                state->decoderWorker =
+                    std::thread(&EspDevice::decodeLoop, state);
+                state->worker = std::thread(&EspDevice::receiveLoop, state);
             }
         } catch (...) {
             state->stop = true;
@@ -1701,10 +1757,16 @@ public:
             state->condition.notify_all();
             return result;
         }
-        try { _control->post("/api/v1/stream/stop", Json::Value(Json::objectValue)); }
-        catch (const std::exception &error) { SoapySDR::logf(SOAPY_SDR_WARNING, "stream stop failed: %s", error.what()); }
+        /* Mark the host reader stopped before resetting the device endpoint.
+         * A normal USB STREAM_STOP wakes the outstanding bulk transfer with
+         * PIPE/IO status; if stop is published afterwards, that deliberate
+         * cancellation is misreported as an invalid datagram on every clean
+         * deactivation. The control request still performs the wake, while
+         * the flag distinguishes it from an in-stream transport failure. */
         state->stop = true;
         state->rxWakeCondition.notify_all();
+        try { _control->post("/api/v1/stream/stop", Json::Value(Json::objectValue)); }
+        catch (const std::exception &error) { SoapySDR::logf(SOAPY_SDR_WARNING, "stream stop failed: %s", error.what()); }
         if (state->worker.joinable()) state->worker.join();
         if (state->decoderWorker.joinable()) state->decoderWorker.join();
         state->active = false;
@@ -2075,6 +2137,8 @@ public:
                 "firmware_drops", "queue_drops", "capture_restarts",
                 "rx_agc_active", "rx_agc_current_gain",
                 "rx_agc_robust_peak", "rx_agc_gain_changes",
+                "rx_dc_offset_tracking_active",
+                "rx_dc_offset_error_i", "rx_dc_offset_error_q",
                 "timing_skew_sign", "timing_skew_ppm", "timing_odd_gain_ppm",
                 "adc_dump_cfg", "adc_dump_mode", "tx_replay_words",
                 "tx_replay_segments", "tx_replay_total_cycles",
@@ -2102,7 +2166,8 @@ public:
         info.key = key;
         info.name = key;
         if (key == "tx_replay_deadline_missed" ||
-            key == "tx_replay_queue_underflow" || key == "rx_agc_active") {
+            key == "tx_replay_queue_underflow" || key == "rx_agc_active" ||
+            key == "rx_dc_offset_tracking_active") {
             info.value = "false";
             info.type = SoapySDR::ArgInfo::BOOL;
         } else {
@@ -2124,6 +2189,17 @@ public:
         } else if (key == "rx_agc_active") {
             info.name = "Software AGC active";
             info.description = "True while firmware software AGC controls receive gain";
+        } else if (key == "rx_dc_offset_tracking_active") {
+            info.name = "RX DC-offset tracking active";
+            info.description =
+                "True while automatic receive DC-offset correction is running";
+        } else if (key == "rx_dc_offset_error_i" ||
+                   key == "rx_dc_offset_error_q") {
+            info.name = key == "rx_dc_offset_error_i"
+                ? "RX DC-offset residual I" : "RX DC-offset residual Q";
+            info.description =
+                "Most recent signed residual measured by the automatic DC corrector";
+            info.units = "counts";
         } else if (key == "tx_udp_stale_datagrams") {
             info.name = "Ethernet TX stale datagrams";
             info.description =
@@ -2187,6 +2263,34 @@ public:
                 return std::to_string(agc.get("last_robust_peak", 0).asUInt());
             if (key == "rx_agc_gain_changes")
                 return std::to_string(agc.get("gain_changes", 0).asUInt());
+        }
+        if (key == "rx_dc_offset_tracking_active") {
+            const StreamState *rx = _rxStream;
+            if (rx != nullptr && rx->haveRxTelemetry.load())
+                return rx->rxDcOffsetTrackingActive.load()
+                           ? "true" : "false";
+            const Json::Value status = statusSnapshot();
+            return status.get("dcoc_active", false).asBool()
+                       ? "true" : "false";
+        }
+        if (key == "rx_dc_offset_error_i" ||
+            key == "rx_dc_offset_error_q") {
+            const StreamState *rx = _rxStream;
+            if (rx != nullptr && rx->haveRxTelemetry.load() &&
+                rx->rxDcOffsetTrackingActive.load()) {
+                return std::to_string(key == "rx_dc_offset_error_i"
+                    ? rx->rxDcOffsetErrorI.load()
+                    : rx->rxDcOffsetErrorQ.load());
+            }
+            const uint32_t diagnostic =
+                statusSnapshot().get("dcoc_diag", 0).asUInt();
+            uint32_t field = key == "rx_dc_offset_error_i"
+                ? (diagnostic >> 14) & 0x3fffu
+                : diagnostic & 0x3fffu;
+            const int32_t value = (field & 0x2000u) != 0u
+                ? static_cast<int32_t>(field | 0xffffc000u)
+                : static_cast<int32_t>(field);
+            return std::to_string(value);
         }
         if (key.rfind("tx_replay_", 0) == 0) {
             const Json::Value status = statusSnapshot();
@@ -3361,12 +3465,33 @@ private:
         state->rxGain = le32(frame + 28);
         state->rxSoftwareAgcActive =
             (frameFlags & IQ_FLAG_SOFTWARE_AGC_ACTIVE) != 0u;
-        state->rxAgcRobustPeak =
-            (frameFlags >> IQ_AGC_ROBUST_PEAK_SHIFT) &
-            IQ_AGC_ROBUST_PEAK_MASK;
-        state->rxAgcGainChanges =
-            (frameFlags >> IQ_AGC_GAIN_CHANGES_SHIFT) &
-            IQ_AGC_GAIN_CHANGES_MASK;
+        const bool analogDc = (frameFlags & IQ_FLAG_DCOC_ACTIVE) != 0u;
+        state->rxDcOffsetTrackingActive =
+            analogDc || state->digitalDcCorrection.load();
+        if (analogDc &&
+            !state->rxSoftwareAgcActive.load()) {
+            const auto signed12 = [](uint32_t value) {
+                value &= IQ_DCOC_ERROR_MASK;
+                return (value & 0x800u) != 0u
+                    ? static_cast<int32_t>(value | 0xfffff000u)
+                    : static_cast<int32_t>(value);
+            };
+            state->rxDcOffsetErrorI = signed12(
+                frameFlags >> IQ_DCOC_ERROR_I_SHIFT);
+            state->rxDcOffsetErrorQ = signed12(
+                frameFlags >> IQ_DCOC_ERROR_Q_SHIFT);
+            state->rxAgcRobustPeak = 0;
+            state->rxAgcGainChanges = 0;
+        } else {
+            state->rxDcOffsetErrorI = 0;
+            state->rxDcOffsetErrorQ = 0;
+            state->rxAgcRobustPeak =
+                (frameFlags >> IQ_AGC_ROBUST_PEAK_SHIFT) &
+                IQ_AGC_ROBUST_PEAK_MASK;
+            state->rxAgcGainChanges =
+                (frameFlags >> IQ_AGC_GAIN_CHANGES_SHIFT) &
+                IQ_AGC_GAIN_CHANGES_MASK;
+        }
         state->haveRxTelemetry = true;
         const uint32_t timestampUs32 = le32(frame + 12);
         const uint32_t sampleRateHz = le32(frame + 20);
@@ -3410,6 +3535,9 @@ private:
                 state->queue.clear();
                 state->captureRestarts++;
                 resetRealDsp(state);
+                state->dcEstimateI = 0.0;
+                state->dcEstimateQ = 0.0;
+                state->dcEstimateInitialized = false;
                 if (!suppressContinuity) state->overflowPending = true;
             }
             if (source > state->expectedSource) {
@@ -3432,6 +3560,49 @@ private:
             }
         }
         auto enqueue = [state](SampleBlock &&ready) {
+            if (state->digitalDcCorrection.load() && ready.samples != 0u) {
+                int64_t sumI = 0;
+                int64_t sumQ = 0;
+                for (std::size_t i = 0; i < ready.samples; ++i) {
+                    sumI += ready.iq[2 * i];
+                    sumQ += ready.iq[2 * i + 1];
+                }
+                const double meanI = double(sumI) / ready.samples;
+                const double meanQ = double(sumQ) / ready.samples;
+                if (!state->dcEstimateInitialized) {
+                    state->dcEstimateI = meanI;
+                    state->dcEstimateQ = meanQ;
+                    state->dcEstimateInitialized = true;
+                } else {
+                    const double rate = ready.sampleRateHz != 0u
+                        ? ready.sampleRateHz : RX_BASE_SAMPLE_RATE;
+                    constexpr double timeConstantSeconds = 0.25;
+                    const double alpha = 1.0 - std::exp(
+                        -double(ready.samples) /
+                        (rate * timeConstantSeconds));
+                    state->dcEstimateI +=
+                        alpha * (meanI - state->dcEstimateI);
+                    state->dcEstimateQ +=
+                        alpha * (meanQ - state->dcEstimateQ);
+                }
+                const int32_t correctionI = static_cast<int32_t>(
+                    std::lround(state->dcEstimateI));
+                const int32_t correctionQ = static_cast<int32_t>(
+                    std::lround(state->dcEstimateQ));
+                for (std::size_t i = 0; i < ready.samples; ++i) {
+                    ready.iq[2 * i] = static_cast<int16_t>(std::clamp(
+                        int32_t(ready.iq[2 * i]) - correctionI,
+                        -32768, 32767));
+                    ready.iq[2 * i + 1] = static_cast<int16_t>(std::clamp(
+                        int32_t(ready.iq[2 * i + 1]) - correctionQ,
+                        -32768, 32767));
+                }
+                state->rxDcOffsetErrorI = static_cast<int32_t>(
+                    std::lround(meanI - state->dcEstimateI));
+                state->rxDcOffsetErrorQ = static_cast<int32_t>(
+                    std::lround(meanQ - state->dcEstimateQ));
+                state->rxDcOffsetTrackingActive = true;
+            }
             if (state->queue.size() >= MAX_QUEUE_BLOCKS) {
                 state->queue.pop_front();
                 state->queueDrops++;

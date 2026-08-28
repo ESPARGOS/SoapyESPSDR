@@ -165,6 +165,7 @@ SOAPY_SDR_PLUGIN_PATH=/home/florian/prgm/esp32/SoapyESPSDR/build gqrx
 - Continuous TX rates of 5.333 (320/60), 5, 4.444, 4, 3.333, 2.5, and
   2 MSa/s over native USB; Ethernet advertises 4, 3.333, 2.5, and 2 MSa/s
 - Automatic or manual receive gain
+- Switchable automatic receive DC-offset tracking
 - Manual receive gain from 0 to 69 dB in 1 dB steps on the tested board
 - Calibrated relative TX gain from 0 to 19.57 dB
 - Open/widest or 13–54 MHz analog receive-filter bandwidth
@@ -173,6 +174,17 @@ SOAPY_SDR_PLUGIN_PATH=/home/florian/prgm/esp32/SoapyESPSDR/build gqrx
 Manual gain selects the ESP32-S31 PHY's calibrated receive-gain table. The
 firmware publishes the available range, unit, and step through its status API,
 and SoapyESPSDR reports those values to applications.
+
+The RX DC-offset mode is enabled by default. Production PARLIO IQ uses a
+host-side tracker with a 0.25-second time constant; this avoids the S31's
+non-monotonic analog correction response while removing residual LO
+self-mixing DC on either transport. Applications can disable it through
+Soapy's `setDCOffsetMode()` to preserve the raw converter mean. On the bench at
+2.38 GHz, 4 MSa/s, and 69 dB gain it reduced a 113.3-count DC vector to 4.21
+counts with zero loss. The `rx_dc_offset_tracking_active` boolean and signed
+`rx_dc_offset_error_i`/`rx_dc_offset_error_q` sensors are updated from the live
+sample path without HTTP traffic. Characterized legacy dump routes retain the
+firmware analog servo, but production PARLIO never drives that actuator.
 
 The transport preserves frame ordering and reports missing source chunks,
 firmware drops, acquisition overruns, and host-queue loss as overflow events.

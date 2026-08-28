@@ -26,6 +26,7 @@ int main(int argc, char **argv)
     const double oldTxSampleRate = device->getSampleRate(SOAPY_SDR_TX, 0);
     const double oldGain = device->getGain(SOAPY_SDR_RX, 0);
     const bool oldAgc = device->getGainMode(SOAPY_SDR_RX, 0);
+    const bool oldDcOffsetMode = device->getDCOffsetMode(SOAPY_SDR_RX, 0);
     const std::string oldFilterOverride = device->readSetting("rx_filter_override");
     const std::string oldTxGainCode = device->readSetting("tx_gain_code");
     const std::string oldTxWireFormat = device->readSetting("tx_wire_format");
@@ -44,6 +45,25 @@ int main(int argc, char **argv)
         device->setBandwidth(SOAPY_SDR_RX, 0, 21e6);
         std::cout << "set gain\n";
         device->setGain(SOAPY_SDR_RX, 0, 40);
+        std::cout << "toggle automatic DC-offset correction\n";
+        if (!device->hasDCOffsetMode(SOAPY_SDR_RX, 0) ||
+            device->hasDCOffsetMode(SOAPY_SDR_TX, 0))
+            throw std::runtime_error("RX DC-offset mode capability mismatch");
+        device->setDCOffsetMode(SOAPY_SDR_RX, 0, false);
+        if (device->getDCOffsetMode(SOAPY_SDR_RX, 0))
+            throw std::runtime_error("DC-offset mode disable readback mismatch");
+        if (device->getSensorInfo("rx_dc_offset_tracking_active").type !=
+            SoapySDR::ArgInfo::BOOL)
+            throw std::runtime_error("DC-offset sensor type mismatch");
+        for (const char *key : {"rx_dc_offset_error_i",
+                                "rx_dc_offset_error_q"}) {
+            if (device->getSensorInfo(key).type != SoapySDR::ArgInfo::INT)
+                throw std::runtime_error("DC-offset error sensor type mismatch");
+            (void)std::stoi(device->readSensor(key));
+        }
+        device->setDCOffsetMode(SOAPY_SDR_RX, 0, true);
+        if (!device->getDCOffsetMode(SOAPY_SDR_RX, 0))
+            throw std::runtime_error("DC-offset mode enable readback mismatch");
         if (device->getFrequency(SOAPY_SDR_RX, 0) != 2437125000.0) throw std::runtime_error("frequency readback mismatch");
         if (std::abs(device->getFrequencyCorrection(SOAPY_SDR_RX, 0) - 8.272) > 0.0005)
             throw std::runtime_error("frequency-correction readback mismatch");
@@ -159,7 +179,7 @@ int main(int argc, char **argv)
         (void)std::stoul(device->readSensor("rx_agc_current_gain"));
         (void)std::stoul(device->readSensor("rx_agc_robust_peak"));
         (void)std::stoul(device->readSensor("rx_agc_gain_changes"));
-        std::cout << "frequency, correction, analog bandwidth, RX/TX gain, duty cycle, and sample rates: OK\n";
+        std::cout << "frequency, correction, DC offset, analog bandwidth, RX/TX gain, duty cycle, and sample rates: OK\n";
     } catch (const std::exception &error) {
         std::cerr << error.what() << '\n';
         result = 1;
@@ -184,6 +204,7 @@ int main(int argc, char **argv)
         device->writeSetting("tx_wire_format", oldTxWireFormat);
         device->setGain(SOAPY_SDR_RX, 0, oldGain);
         device->setGainMode(SOAPY_SDR_RX, 0, oldAgc);
+        device->setDCOffsetMode(SOAPY_SDR_RX, 0, oldDcOffsetMode);
         device->writeSetting("cycle_total", oldCycleTotal);
         device->writeSetting("cycle_stream", oldCycleStream);
     } catch (const std::exception &error) {
