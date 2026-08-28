@@ -84,6 +84,9 @@ constexpr std::size_t IQ_FRAME_BYTES = IQ_HEADER_BYTES + IQ_SAMPLES * 4 + 4;
 // 10 sample bits), zero CRC field. Ethernet uses this to stay below the link
 // ceiling; USB may return full IQC1 and convert to the requested host format.
 constexpr std::size_t IQ8_FRAME_BYTES = IQ_HEADER_BYTES + IQ_SAMPLES * 2 + 4;
+// Native USB at 16 MS/s uses PARLIO to select the top four bits of each
+// component in hardware: signed I is the low nibble and signed Q the high.
+constexpr std::size_t IQ4_FRAME_BYTES = IQ_HEADER_BYTES + IQ_SAMPLES + 4;
 constexpr std::size_t REAL8_SAMPLES = IQ_SAMPLES * 4;
 constexpr std::size_t REAL8_FRAME_BYTES = IQ_HEADER_BYTES + REAL8_SAMPLES + 4;
 constexpr std::size_t MAX_BLOCK_SAMPLES = REAL8_SAMPLES / 2;
@@ -176,8 +179,12 @@ constexpr uint8_t USB_EP_TX_OUT = 0x02;
 constexpr std::size_t USB_CTRL_HEADER_BYTES = 16;
 constexpr std::size_t USB_CTRL_MAX_PAYLOAD = 2304;
 constexpr unsigned USB_CTRL_TIMEOUT_MS = 3000;
-constexpr int USB_STREAM_TRANSFERS = 8;
-constexpr std::size_t USB_STREAM_TRANSFER_BYTES = 256 * 1024;
+constexpr uint32_t USB_STARTUP_PREFIX_DATAGRAMS = 8;
+/* Firmware endpoint submissions are at most one 14-frame batch (< 64 KiB)
+ * and terminate with a short packet. Keep endpoint ingestion copy-only and
+ * absorb decoder scheduling jitter in a separate bounded SPSC ring. */
+constexpr std::size_t USB_STREAM_TRANSFER_BYTES = 64 * 1024;
+constexpr uint32_t USB_RX_BLOCK_RING_SIZE = 64;
 /* One host URB may span many 4 KiB DWC2 receive arms. Keeping the complete
  * maximum replay batch pending in the kernel removes a userspace round trip
  * at every device-side chunk without increasing the firmware's PSRAM burst. */
@@ -672,6 +679,11 @@ struct RxDatagram {
     uint16_t bytes = 0;
 };
 
+struct UsbRxBlock {
+    std::array<uint8_t, USB_STREAM_TRANSFER_BYTES> data{};
+    uint32_t bytes = 0;
+};
+
 struct TxBurstStatus {
     int result = 0;
     bool hasTime = false;
@@ -722,7 +734,6 @@ struct StreamState {
     uint16_t port = 0;
     std::shared_ptr<UsbContext> usb; // non-null when streaming over USB
     std::vector<uint8_t> usbParseBuffer;
-    std::atomic<int> usbActiveTransfers{0};
     std::atomic<bool> active{false};
     std::atomic<bool> stop{false};
     std::thread worker;
@@ -730,6 +741,9 @@ struct StreamState {
     std::vector<RxDatagram> rxDatagramRing;
     std::atomic<uint32_t> rxDatagramHead{0};
     std::atomic<uint32_t> rxDatagramTail{0};
+    std::vector<UsbRxBlock> usbRxBlockRing;
+    std::atomic<uint32_t> usbRxBlockHead{0};
+    std::atomic<uint32_t> usbRxBlockTail{0};
     std::mutex rxWakeMutex;
     std::condition_variable rxWakeCondition;
     std::mutex mutex;
@@ -1374,7 +1388,10 @@ public:
         patch["bandwidth"]["bw_mhz"] = 20;
         patch["bandwidth"]["second_chan"] = 0;
         patch["rx_filter"]["filter_bw_mhz"] = mhz;
-        patch["rx_filter"]["rx_filter_override"] = 62;
+        /* Use the firmware's production native-IQ route. Expert mode 62 is
+         * retained only as a compatibility alias for older hosts and cannot
+         * select the S31's one-byte PARLIO geometry. */
+        patch["rx_filter"]["rx_filter_override"] = 0;
         applyPatch(patch);
     }
     double getBandwidth(const int direction, const std::size_t channel) const override
@@ -1530,7 +1547,10 @@ public:
         patch["stream"]["output_mode"] = 0;
         patch["stream"]["stream_wifi_packets"] = 0;
         patch["trigger"]["trigger_mode"] = 0;
-        patch["rx_filter"]["rx_filter_override"] = 62;
+        /* Select the production native-IQ route. The legacy expert-mode 62
+         * alias always retains 16-bit PARLIO geometry and therefore cannot
+         * produce the one-byte IQC4 stream used at 16 MSa/s over USB. */
+        patch["rx_filter"]["rx_filter_override"] = 0;
         const unsigned total = _cycleTotal.load();
         const unsigned streamed = _cycleStream.load();
         patch["trigger"]["trigger_config"] = intervalTrigger(total, streamed);
@@ -1548,6 +1568,7 @@ public:
             state->haveEpoch = false;
             state->haveExpectedEpoch.store(false, std::memory_order_release);
             state->usbCurrentEpochDatagrams = 0;
+            state->usbParseBuffer.clear();
             state->haveDatagramSequence = false;
             state->missingDatagramSequences.clear();
             state->unrecoveredDatagramGaps = 0;
@@ -1560,15 +1581,17 @@ public:
         }
         if (state->usb != nullptr) {
             /* Flush any endpoint data left by a crashed or bandwidth-starved
-             * previous client before submitting this session's IN transfers.
-             * The firmware resets the stream endpoint as part of STOP. */
+             * previous client before starting this session. The firmware
+             * resets the stream endpoint as part of STOP. */
             _control->post("/api/v1/stream/stop",
                            Json::Value(Json::objectValue));
         }
         state->stop = false;
         state->active = true;
         if (state->usb != nullptr) {
-            state->worker = std::thread(&EspDevice::usbReceiveLoop, state);
+            state->usbRxBlockRing.resize(USB_RX_BLOCK_RING_SIZE);
+            state->usbRxBlockHead = 0;
+            state->usbRxBlockTail = 0;
         } else {
             state->rxDatagramRing.resize(RX_DATAGRAM_RING_SIZE);
             state->rxDatagramHead = 0;
@@ -1579,9 +1602,14 @@ public:
         }
         Json::Value body;
         body["port"] = state->port;
-        // The combined S31 image emits native packed IQC8 on both high-speed
-        // transports. Request the compact native-IQ framing explicitly.
-        body["stream_format"] = 1;
+        // At 16 MS/s native USB selects one packed byte per complex sample in
+        // PARLIO itself. This is the continuous operating point that fits the
+        // S31 PSRAM/DWC2 fabric; lower USB rates and Ethernet retain IQC8.
+        body["stream_format"] =
+            state->usb != nullptr &&
+                    getSampleRate(SOAPY_SDR_RX, 0) >= RX_BASE_SAMPLE_RATE
+                ? 2
+                : 1;
         try {
             const Json::Value startStatus =
                 _control->post("/api/v1/stream/start", body);
@@ -1592,6 +1620,18 @@ public:
                 startStatus["stream_epoch"].asUInt(),
                 std::memory_order_relaxed);
             state->haveExpectedEpoch.store(true, std::memory_order_release);
+            /* Do not overlap the synchronous STREAM_START control request
+             * with a synchronous bulk read on the same libusb context.  On
+             * Linux that leaves the subsequent reads paced at roughly one
+             * scheduler tick and starves the device's three batch slots.
+             * Starting the dedicated reader immediately after the response
+             * matches the lossless low-level client. */
+            if (state->usb != nullptr) {
+                state->decoderWorker =
+                    std::thread(&EspDevice::usbDecodeLoop, state);
+                state->worker =
+                    std::thread(&EspDevice::usbReceiveLoop, state);
+            }
         } catch (...) {
             state->stop = true;
             state->rxWakeCondition.notify_all();
@@ -3303,11 +3343,13 @@ private:
             std::memcmp(frame, "IQC1", 4) == 0;
         const bool compressed = frameBytes == IQ8_FRAME_BYTES &&
             std::memcmp(frame, "IQC8", 4) == 0;
+        const bool compressed4 = frameBytes == IQ4_FRAME_BYTES &&
+            std::memcmp(frame, "IQC4", 4) == 0;
         const bool real = frameBytes == REAL8_FRAME_BYTES &&
             std::memcmp(frame, "IQR8", 4) == 0;
         const uint32_t wireCrc = frameBytes >= 4 ?
             le32(frame + frameBytes - 4) : 0;
-        if ((!full && !compressed && !real) ||
+        if ((!full && !compressed && !compressed4 && !real) ||
             (wireCrc != 0 &&
              wireCrc != static_cast<uint32_t>(
                  crc32(0, frame, frameBytes - 4)))) {
@@ -3335,6 +3377,14 @@ private:
             // bits; scale to the canonical 10-bit range.
             for (std::size_t i = 0; i < IQ_SAMPLES * 2; ++i) {
                 block.iq[i] = int16_t(int8_t(sampleData[i])) * 4;
+            }
+        } else if (compressed4) {
+            for (std::size_t i = 0; i < IQ_SAMPLES; ++i) {
+                const uint8_t packed = sampleData[i];
+                const int8_t in = static_cast<int8_t>(packed << 4) >> 4;
+                const int8_t qn = static_cast<int8_t>(packed) >> 4;
+                block.iq[2 * i] = int16_t(in) * 64;
+                block.iq[2 * i + 1] = int16_t(qn) * 64;
             }
         } else if (full) {
             for (std::size_t i = 0; i < IQ_SAMPLES; ++i) {
@@ -3452,6 +3502,7 @@ private:
         if (!parseHeader(data, bytes, header)) { state->invalidDatagrams++; return; }
         if (std::memcmp(header.frameMagic.data(), "IQC1", 4) != 0 &&
             std::memcmp(header.frameMagic.data(), "IQC8", 4) != 0 &&
+            std::memcmp(header.frameMagic.data(), "IQC4", 4) != 0 &&
             std::memcmp(header.frameMagic.data(), "IQR8", 4) != 0 &&
             std::memcmp(header.frameMagic.data(), "IQB8", 4) != 0) return;
         if (state->haveExpectedEpoch.load(std::memory_order_acquire) &&
@@ -3459,7 +3510,7 @@ private:
                                 std::memory_order_relaxed))
             return;
         if (state->usb != nullptr &&
-            state->usbCurrentEpochDatagrams < USB_STREAM_TRANSFERS)
+            state->usbCurrentEpochDatagrams < USB_STARTUP_PREFIX_DATAGRAMS)
             state->usbCurrentEpochDatagrams++;
         if (!state->haveEpoch || state->epoch != header.epoch) {
             std::lock_guard<std::mutex> lock(state->mutex);
@@ -3689,10 +3740,8 @@ private:
     static void usbConsume(StreamState *state)
     {
         auto &buffer = state->usbParseBuffer;
-        /* Submit IN transfers before STREAM_START so no prefix of the first
-         * batch can be lost. Until the control response publishes the new
-         * epoch, retain whatever those transfers collect instead of letting
-         * a valid old-epoch tail establish receiver state. */
+        /* Retain any bounded startup prefix until the STREAM_START response
+         * has published the new epoch. */
         if (!state->haveExpectedEpoch.load(std::memory_order_acquire)) return;
         std::size_t pos = 0;
         while (buffer.size() - pos >= UDP_HEADER_BYTES) {
@@ -3709,7 +3758,8 @@ private:
                  * only that bounded acquisition prefix; once one current
                  * datagram per URB has arrived, every resync byte is genuine
                  * in-stream corruption and remains strictly counted. */
-                if (state->usbCurrentEpochDatagrams >= USB_STREAM_TRANSFERS)
+                if (state->usbCurrentEpochDatagrams >=
+                    USB_STARTUP_PREFIX_DATAGRAMS)
                     state->invalidDatagrams++;
                 continue;
             }
@@ -3721,47 +3771,75 @@ private:
         buffer.erase(buffer.begin(), buffer.begin() + pos);
     }
 
-    static void usbStreamCallback(libusb_transfer *transfer)
+    static void usbDecodeLoop(StreamState *state)
     {
-        auto *state = static_cast<StreamState *>(transfer->user_data);
-        bool resubmit = false;
-        if (transfer->status == LIBUSB_TRANSFER_COMPLETED) {
-            state->usbParseBuffer.insert(state->usbParseBuffer.end(), transfer->buffer,
-                                         transfer->buffer + transfer->actual_length);
-            usbConsume(state);
-            resubmit = true;
+        while (true) {
+            uint32_t tail =
+                state->usbRxBlockTail.load(std::memory_order_relaxed);
+            const uint32_t head =
+                state->usbRxBlockHead.load(std::memory_order_acquire);
+            if (tail != head) {
+                const UsbRxBlock &slot =
+                    state->usbRxBlockRing[tail % USB_RX_BLOCK_RING_SIZE];
+                state->usbParseBuffer.insert(state->usbParseBuffer.end(),
+                                             slot.data.begin(),
+                                             slot.data.begin() + slot.bytes);
+                usbConsume(state);
+                state->usbRxBlockTail.store(tail + 1,
+                                            std::memory_order_release);
+                continue;
+            }
+            if (state->stop.load()) break;
+            std::unique_lock<std::mutex> lock(state->rxWakeMutex);
+            state->rxWakeCondition.wait_for(
+                lock, std::chrono::milliseconds(2), [state]() {
+                    return state->stop.load() ||
+                        state->usbRxBlockTail.load(std::memory_order_relaxed) !=
+                        state->usbRxBlockHead.load(std::memory_order_acquire);
+                });
         }
-        if (resubmit && !state->stop && libusb_submit_transfer(transfer) == 0) return;
-        state->usbActiveTransfers--;
     }
 
     static void usbReceiveLoop(StreamState *state)
     {
-        std::array<libusb_transfer *, USB_STREAM_TRANSFERS> transfers{};
-        std::vector<std::vector<uint8_t>> buffers(USB_STREAM_TRANSFERS,
-                                                  std::vector<uint8_t>(USB_STREAM_TRANSFER_BYTES));
-        for (int i = 0; i < USB_STREAM_TRANSFERS; ++i) {
-            transfers[i] = libusb_alloc_transfer(0);
-            libusb_fill_bulk_transfer(transfers[i], state->usb->handle, USB_EP_STREAM_IN,
-                                      buffers[i].data(), static_cast<int>(buffers[i].size()),
-                                      &EspDevice::usbStreamCallback, state, 0);
-            if (libusb_submit_transfer(transfers[i]) == 0) state->usbActiveTransfers++;
-        }
+        std::vector<uint8_t> buffer(USB_STREAM_TRANSFER_BYTES);
         while (!state->stop) {
-            timeval tv{0, 100000};
-            libusb_handle_events_timeout(state->usb->context, &tv);
+            int received = 0;
+            const int status = libusb_bulk_transfer(
+                state->usb->handle, USB_EP_STREAM_IN, buffer.data(),
+                static_cast<int>(buffer.size()), &received, 2000);
+            if (status == LIBUSB_ERROR_TIMEOUT) continue;
+            if (status != 0 || received <= 0) {
+                if (state->stop) break;
+                state->invalidDatagrams++;
+                if (status == LIBUSB_ERROR_INTERRUPTED) continue;
+                if (status == LIBUSB_ERROR_PIPE) {
+                    libusb_clear_halt(state->usb->handle, USB_EP_STREAM_IN);
+                    continue;
+                }
+                break;
+            }
+            const uint32_t head =
+                state->usbRxBlockHead.load(std::memory_order_relaxed);
+            const uint32_t tail =
+                state->usbRxBlockTail.load(std::memory_order_acquire);
+            if (head - tail >= USB_RX_BLOCK_RING_SIZE) {
+                state->queueDrops++;
+                {
+                    std::lock_guard<std::mutex> lock(state->mutex);
+                    state->overflowPending = true;
+                }
+                state->condition.notify_all();
+                continue;
+            }
+            UsbRxBlock &slot =
+                state->usbRxBlockRing[head % USB_RX_BLOCK_RING_SIZE];
+            std::memcpy(slot.data.data(), buffer.data(),
+                        static_cast<std::size_t>(received));
+            slot.bytes = static_cast<uint32_t>(received);
+            state->usbRxBlockHead.store(head + 1, std::memory_order_release);
+            state->rxWakeCondition.notify_one();
         }
-        for (int i = 0; i < USB_STREAM_TRANSFERS; ++i) {
-            if (transfers[i] != nullptr) libusb_cancel_transfer(transfers[i]);
-        }
-        while (state->usbActiveTransfers > 0) {
-            timeval tv{0, 100000};
-            libusb_handle_events_timeout(state->usb->context, &tv);
-        }
-        for (auto *transfer : transfers) {
-            if (transfer != nullptr) libusb_free_transfer(transfer);
-        }
-        state->usbParseBuffer.clear();
     }
 
     void setTxEthernetWireFormat(const std::string &value)

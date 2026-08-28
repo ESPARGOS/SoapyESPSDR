@@ -87,14 +87,17 @@ MAC address, shown by `--find`). One combined firmware image keeps Ethernet
 and USB control available together; the most recent RX stream start owns the
 half-duplex sample engine.
 
-USB RX uses compact native `IQC8` at the selected RX rate. USB TX arms exact-size
+USB RX uses compact native `IQC8` below 16 MSa/s. At 16 MSa/s the firmware
+selects the top four signed bits of I and Q in PARLIO and sends one packed
+`IQC4` byte per complex sample; the module expands either representation to
+the requested `CS8`, `CS16`, or `CF32` host format. USB TX arms exact-size
 device allocations, transfers packed IQ10 words in 32 KiB bulk chunks, and
 queues them to the live TXDC engine without a second device-side waveform
 copy. Larger transactions reduce endpoint-completion overhead beside the
-realtime PSRAM stager. The present
-implementation is validated lossless at 8 MSa/s RX; a
-16 MSa/s request reaches about 9.5 MSa/s and reports overflows/gaps, so use
-Gigabit Ethernet for lossless 16 MSa/s. Raw USB device access without root
+realtime PSRAM stager. The present implementation is validated lossless at
+16 MSa/s RX. `IQC4` trades quantization headroom for bandwidth: use Ethernet's
+signed `IQC8` path when component precision matters more than a direct USB
+connection. Raw USB device access without root
 requires a udev rule for VID `303a`,
 for example:
 
@@ -492,10 +495,10 @@ Other current limitations:
   exceeded the combined S31 PARLIO/PSRAM/GMAC path even though the raw Gigabit
   link budget was sufficient.
 - Native USB enumerates at 480 Mbit/s and is validated for Soapy control,
-  lossless 8 MSa/s RX, continuous 5 through 2 MSa/s TX, and repeated
-  RX/TX switching.
-  Its current endpoint path reaches about 9.5 MSa/s under a 16 MSa/s request,
-  with honest overflow/gap reporting; use Ethernet for lossless 16 MSa/s.
+  lossless 16 MSa/s RX, continuous 5.333 through 2 MSa/s TX, and repeated
+  RX/TX plus USB/Ethernet switching. The 16 MSa/s `IQC4` path completed a
+  ten-second CS16 run and separate CS8/CF32 runs with no transport or queue
+  loss; lower rates retain signed `IQC8` component precision.
 - On this bench, `enp0s13f0u1u1` is the host's normal internet/LAN uplink
   through an RTL8153 in a USB-C dock; ESP Ethernet traffic reaches the host
   through that LAN. `eth0` is PlutoSDR's emulated USB Ethernet, not the ESP
