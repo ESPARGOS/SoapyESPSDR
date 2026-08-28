@@ -345,32 +345,35 @@ Bench measurements at 2.38 GHz provide useful scale for this contract:
 - Ten batches at 10/3 MSa/s measured 1.572864 s over Ethernet (exact at the
   Pluto detector's 512-sample resolution) and 1.573120 s over USB, again with
   zero boundary-gap cycles and flat seams.
-- With ambient traffic on the shared LAN, 50 Ethernet batches at 2.5 MSa/s
-  sent 26,214,400 samples and 100 batches at 2 MSa/s sent 52,428,800 samples,
-  both with zero gaps/errors. Pluto two-tone checks measured the requested
-  rates within +7.2 and +10.1 ppm; CFO-corrected Fs/16 captures measured 34.9
-  and 36.3 dB image rejection. These are the robust Ethernet fallbacks when
-  the edge-rate modes report underflow.
+- With ambient traffic on the shared LAN, a new 100-batch Ethernet run at
+  2.5 MSa/s sent 52,428,800 samples in 20.97152 s with zero gaps, underflow,
+  or transport errors; 2 MSa/s is also lossless. Pluto two-tone checks measured
+  the requested rates within +7.2 and +10.1 ppm; CFO-corrected Fs/16 captures
+  measured 34.9 and 36.3 dB image rejection. These are the robust Ethernet
+  fallbacks when the edge-rate modes report underflow.
 - Native USB additionally sustains 40/9 MSa/s. A 50-batch run sent 26,214,400
   samples in 5.8982415 s versus 5.8982400 s ideal, with zero firmware gaps and
   USB errors. A ten-batch Soapy/Pluto capture retained all nine seams and its
   RF duration agreed within the 0.256 ms analysis-block resolution. This rate
   is intentionally absent from the Ethernet capability list.
-- Native USB also exposes a 5 MSa/s TCM-staged backend. A 100-batch run sent
-  52,428,800 samples in 10.48576 s with zero USB errors and aggregate timing
-  176 CPU cycles from ideal. HackRF measured 62.7 dB tone-to-spectral-median,
-  45.2 dB image rejection, and no clipping through the public Soapy API.
+- Native USB also exposes a 5 MSa/s DIRAM-staged backend. It borrows the 30
+  stopped GMAC RX buffers as 368-sample scatter slots, providing 11,040
+  samples (2.208 ms) of local elasticity, and decodes four packed IQ10 words
+  at phase 32 of every 64-cycle RF interval. A 500-batch run sent 262,144,000
+  samples over 52.4288 s of RF with zero USB errors or underflow, a 47-cycle
+  largest steady boundary correction, and only 558 cycles of aggregate
+  scheduler error.
   Soapy uses the firmware's explicit `queue_underflow` status rather than
-  treating normal TCM slot timing corrections as starvation: the full chain
+  treating normal staging-slot timing corrections as starvation: the full chain
   returns clean `END_BURST`, while a forced host pause returns
   `SOAPY_SDR_UNDERFLOW`.
-  Measured TCM-slot handoff jitter reached roughly 1 us in the resource-safe
-  build, so 40/9 MSa/s remains the conservative choice for especially
-  phase-sensitive work.
-- `testing/soapy_tx_endurance.py` extended that native-USB result to 500
-  public-API writes: 262,144,000 samples (58.9824 s of RF), 500 firmware
-  segments, zero gaps/errors, and 1.25 us aggregate timing error after reducing
-  the four 32-bit cycle-counter wraps modulo 2^32. RX resumed losslessly.
+  A final Pluto wideband run measured -18.64 dB median and -16.18 dB p95
+  differential EVM, no pair worse than -6 dB, and 0.9955 repeat coherence.
+- `testing/soapy_tx_endurance.py` checks duration modulo the firmware's 32-bit
+  cycle counter, so long staged streams cannot pass merely because every sample
+  eventually drained. The 500-write 5 MSa/s result above counted every small
+  scatter slot independently of the host's 524,288-sample batches.
+  RX resumed losslessly after deliberate TX starvation.
 - RX activation defaults to continuous 1/1 capture. It does not inherit the
   firmware's deliberately sparse 1/2501 idle-safe boot cadence; applications
   that want duty cycling can still pass `cycle_total` and `cycle_stream`.
@@ -384,9 +387,11 @@ Bench measurements at 2.38 GHz provide useful scale for this contract:
   roughly ten times as many severe differential-symbol outliers as the
   72-cycle 40/9 MSa/s rate. At 68 cycles rare lateness reached 27.6 us.
 - Ethernet uses cumulative 256-datagram acknowledgements and 16-frame paced
-  flights. Its steady 2 MiB upload latency is about 130.8--131.1 ms at the
-  4 MSa/s limit, versus 131.072 ms of RF time. The sub-millisecond pacing loop
-  deliberately occupies one host core for about 97 ms per full batch.
+  flights. Soapy retains libcurl's connection cache and the firmware applies
+  `TCP_NODELAY` to TX-arm connections, reducing repeated local arm latency
+  from about 52 ms to 18--19 ms. Even so, current shared-LAN 4 MSa/s commits
+  took roughly 147--158 ms versus 131.072 ms of RF, so 2.5 MSa/s remains the
+  proven continuous Ethernet rate.
 - The absolute 320 MHz sample scheduler preserves exact total duration, but a
   PSRAM/cache stall can make an individual TXDC write a few microseconds late;
   following samples catch up. This is a modulation-jitter limit even though it

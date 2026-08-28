@@ -81,6 +81,7 @@ constexpr uint16_t TX_UDP_FLAG_AUTOSTART = 1u << 8;
 constexpr unsigned TX_UDP_RATE_CODE_SHIFT = 9;
 constexpr uint16_t TX_UDP_FLAG_MORE = 1u << 13;
 constexpr uint16_t TX_UDP_FLAG_CONTINUE = 1u << 14;
+constexpr uint16_t TX_USB_FLAG_PACKED20 = 1u << 15;
 constexpr unsigned STREAM_SELECTION_MAX = 1'000'000;
 constexpr uint32_t S31_ADC_SOURCE_MUX_MASK = 0x0000000fu;
 constexpr std::size_t REAL_TIMING_TAPS = 25;
@@ -143,7 +144,10 @@ constexpr std::size_t USB_CTRL_MAX_PAYLOAD = 2048;
 constexpr unsigned USB_CTRL_TIMEOUT_MS = 3000;
 constexpr int USB_STREAM_TRANSFERS = 8;
 constexpr std::size_t USB_STREAM_TRANSFER_BYTES = 256 * 1024;
-constexpr std::size_t USB_TX_TRANSFER_BYTES = 4 * 1024;
+/* One host URB may span many 4 KiB DWC2 receive arms. Keeping the complete
+ * maximum replay batch pending in the kernel removes a userspace round trip
+ * at every device-side chunk without increasing the firmware's PSRAM burst. */
+constexpr std::size_t USB_TX_TRANSFER_BYTES = 4 * 1024 * 1024;
 
 enum UsbControlOpcode : uint32_t {
     USB_OP_GET_STATUS = 1,
@@ -251,10 +255,13 @@ bool jsonContains(const Json::Value &value, const Json::Value &expected)
 class HttpClient {
 public:
     HttpClient(std::string host, unsigned port, std::string interface = {}):
-        _host(std::move(host)), _port(port), _interface(std::move(interface))
+        _host(std::move(host)), _port(port), _interface(std::move(interface)),
+        _curl(nullptr, curl_easy_cleanup)
     {
         static const int initialized = []() { return curl_global_init(CURL_GLOBAL_DEFAULT); }();
         if (initialized != CURLE_OK) throw std::runtime_error("curl_global_init failed");
+        _curl.reset(curl_easy_init());
+        if (!_curl) throw std::runtime_error("curl_easy_init failed");
     }
 
     Json::Value get(const std::string &path) const { return request("GET", path, nullptr); }
@@ -271,8 +278,12 @@ private:
 
     Json::Value request(const char *method, const std::string &path, const Json::Value *body) const
     {
-        std::unique_ptr<CURL, decltype(&curl_easy_cleanup)> curl(curl_easy_init(), curl_easy_cleanup);
-        if (!curl) throw std::runtime_error("curl_easy_init failed");
+        std::lock_guard<std::mutex> lock(_mutex);
+        /* Reset request options while retaining libcurl's connection cache.
+         * Continuous Ethernet TX arms one UDP batch per Soapy write; opening
+         * a fresh TCP control connection for each batch adds avoidable
+         * latency to an otherwise 21.5 MB/s paced payload path. */
+        curl_easy_reset(_curl.get());
         const std::string url = "http://" + _host + ":" + std::to_string(_port) + path;
         std::string response;
         std::string encoded;
@@ -282,25 +293,25 @@ private:
         if (body != nullptr) {
             encoded = jsonString(*body);
             rawHeaders = curl_slist_append(rawHeaders, "Content-Type: application/json");
-            curl_easy_setopt(curl.get(), CURLOPT_POSTFIELDS, encoded.c_str());
-            curl_easy_setopt(curl.get(), CURLOPT_POSTFIELDSIZE, static_cast<long>(encoded.size()));
+            curl_easy_setopt(_curl.get(), CURLOPT_POSTFIELDS, encoded.c_str());
+            curl_easy_setopt(_curl.get(), CURLOPT_POSTFIELDSIZE, static_cast<long>(encoded.size()));
         }
         headers.reset(rawHeaders);
-        curl_easy_setopt(curl.get(), CURLOPT_URL, url.c_str());
-        curl_easy_setopt(curl.get(), CURLOPT_CUSTOMREQUEST, method);
-        curl_easy_setopt(curl.get(), CURLOPT_HTTPHEADER, headers.get());
-        curl_easy_setopt(curl.get(), CURLOPT_WRITEFUNCTION, &HttpClient::writeCallback);
-        curl_easy_setopt(curl.get(), CURLOPT_WRITEDATA, &response);
-        curl_easy_setopt(curl.get(), CURLOPT_CONNECTTIMEOUT_MS, 1500L);
-        curl_easy_setopt(curl.get(), CURLOPT_TIMEOUT_MS, 5000L);
-        curl_easy_setopt(curl.get(), CURLOPT_NOSIGNAL, 1L);
+        curl_easy_setopt(_curl.get(), CURLOPT_URL, url.c_str());
+        curl_easy_setopt(_curl.get(), CURLOPT_CUSTOMREQUEST, method);
+        curl_easy_setopt(_curl.get(), CURLOPT_HTTPHEADER, headers.get());
+        curl_easy_setopt(_curl.get(), CURLOPT_WRITEFUNCTION, &HttpClient::writeCallback);
+        curl_easy_setopt(_curl.get(), CURLOPT_WRITEDATA, &response);
+        curl_easy_setopt(_curl.get(), CURLOPT_CONNECTTIMEOUT_MS, 1500L);
+        curl_easy_setopt(_curl.get(), CURLOPT_TIMEOUT_MS, 5000L);
+        curl_easy_setopt(_curl.get(), CURLOPT_NOSIGNAL, 1L);
         if (!_interface.empty())
-            curl_easy_setopt(curl.get(), CURLOPT_INTERFACE,
+            curl_easy_setopt(_curl.get(), CURLOPT_INTERFACE,
                              _interface.c_str());
         CURLcode result = CURLE_OK;
         for (unsigned attempt = 0; attempt < 3; ++attempt) {
             response.clear();
-            result = curl_easy_perform(curl.get());
+            result = curl_easy_perform(_curl.get());
             if (result == CURLE_OK) break;
             const bool transient =
                 result == CURLE_COULDNT_RESOLVE_HOST ||
@@ -320,7 +331,7 @@ private:
             throw std::runtime_error("HTTP request to " + url + " failed: " + curl_easy_strerror(result));
         }
         long status = 0;
-        curl_easy_getinfo(curl.get(), CURLINFO_RESPONSE_CODE, &status);
+        curl_easy_getinfo(_curl.get(), CURLINFO_RESPONSE_CODE, &status);
         if (status < 200 || status >= 300) {
             throw std::runtime_error("HTTP " + std::to_string(status) + " from " + path + ": " + response);
         }
@@ -330,6 +341,8 @@ private:
     std::string _host;
     unsigned _port;
     std::string _interface;
+    mutable std::mutex _mutex;
+    mutable std::unique_ptr<CURL, decltype(&curl_easy_cleanup)> _curl;
 };
 
 // Abstract control plane: HTTP JSON API or the equivalent USB channel.
@@ -1757,10 +1770,15 @@ public:
                 if (state->format == SOAPY_SDR_CS16) {
                     const auto *samples =
                         static_cast<const int16_t *>(buffers[0]);
-                    iv = static_cast<int32_t>(
-                        std::lround(samples[i * 2] / 64.0));
-                    qv = static_cast<int32_t>(
-                        std::lround(samples[i * 2 + 1] / 64.0));
+                    const int32_t inputI = samples[i * 2];
+                    const int32_t inputQ = samples[i * 2 + 1];
+                    /* Exact lround(x / 64.0) for integer x, including
+                     * half-away-from-zero, without two floating divisions
+                     * and libm calls per complex sample. */
+                    iv = inputI >= 0 ? (inputI + 32) / 64
+                                     : (inputI - 32) / 64;
+                    qv = inputQ >= 0 ? (inputQ + 32) / 64
+                                     : (inputQ - 32) / 64;
                 } else if (state->format == SOAPY_SDR_CS8) {
                     const auto *samples =
                         static_cast<const int8_t *>(buffers[0]);
@@ -1890,6 +1908,7 @@ public:
                 "tx_replay_sample_cycles", "tx_replay_gap_cycles",
                 "tx_replay_maximum_gap_cycles",
                 "tx_replay_deadline_late_max_cycles",
+                "tx_replay_deadline_late_max_word",
                 "tx_replay_duty_ppm",
                 "tx_replay_requested_start_time_ns",
                 "tx_replay_actual_start_time_ns",
@@ -1976,6 +1995,7 @@ public:
             if (key == "tx_replay_gap_cycles") return std::to_string(replay.get("gap_cycles", 0).asUInt());
             if (key == "tx_replay_maximum_gap_cycles") return std::to_string(replay.get("maximum_gap_cycles", 0).asUInt());
             if (key == "tx_replay_deadline_late_max_cycles") return std::to_string(replay.get("deadline_late_max_cycles", 0).asUInt());
+            if (key == "tx_replay_deadline_late_max_word") return std::to_string(replay.get("deadline_late_max_word", 0).asUInt());
             if (key == "tx_replay_requested_start_time_ns") return std::to_string(replay.get("requested_start_time_ns", Json::Int64(0)).asInt64());
             if (key == "tx_replay_actual_start_time_ns") return std::to_string(replay.get("actual_start_time_ns", Json::Int64(0)).asInt64());
             if (key == "tx_replay_start_error_ns") return std::to_string(replay.get("start_error_ns", Json::Int64(0)).asInt64());
@@ -2158,12 +2178,14 @@ private:
         std::array<uint8_t, 16> arm{};
         putLe32(arm.data(), static_cast<uint32_t>(words.size()));
         uint16_t commitFlags = 0;
+        const unsigned rateCode = txRateCode(_txSampleRate);
+        const bool packed20 = _txUdpAutostart && rateCode == 14;
         if (_txUdpAutostart) {
             commitFlags = TX_UDP_FLAG_AUTOSTART |
-                static_cast<uint16_t>(txRateCode(_txSampleRate)
-                                      << TX_UDP_RATE_CODE_SHIFT);
+                static_cast<uint16_t>(rateCode << TX_UDP_RATE_CODE_SHIFT);
             if (more) commitFlags |= TX_UDP_FLAG_MORE;
             if (continuation) commitFlags |= TX_UDP_FLAG_CONTINUE;
+            if (packed20) commitFlags |= TX_USB_FLAG_PACKED20;
         }
         putLe16(arm.data() + 4, commitFlags);
         putLe64(arm.data() + 8, static_cast<uint64_t>(startTimeNs));
@@ -2172,14 +2194,56 @@ private:
         try {
             usbControl->rawRequest(USB_OP_TX_ARM, arm.data(), arm.size());
             armed = true;
-            for (std::size_t offset = 0; offset < words.size();) {
+            /* CF32->IQ10 packing already produced contiguous uint32_t words.
+             * On the normal little-endian Soapy host, transmit that storage
+             * directly: allocating and repacking a 4 KiB vector before each
+             * of 512 synchronous transfers left the 5 MSa/s producer just
+             * below realtime. Retain a one-time portable conversion for a
+             * big-endian host. */
+            std::vector<uint8_t> packed;
+            const uint8_t *wire = nullptr;
+            std::size_t wireBytes = 0;
+            if (packed20) {
+                packed.resize((words.size() * 5 + 1) / 2);
+                std::size_t output = 0;
+                std::size_t input = 0;
+                while (input + 1 < words.size()) {
+                    const uint32_t first = words[input] & 0xfffffu;
+                    const uint32_t second = words[input + 1] & 0xfffffu;
+                    packed[output + 0] = static_cast<uint8_t>(first);
+                    packed[output + 1] = static_cast<uint8_t>(first >> 8);
+                    packed[output + 2] = static_cast<uint8_t>(
+                        (first >> 16) | (second << 4));
+                    packed[output + 3] = static_cast<uint8_t>(second >> 4);
+                    packed[output + 4] = static_cast<uint8_t>(second >> 12);
+                    input += 2;
+                    output += 5;
+                }
+                if (input < words.size()) {
+                    const uint32_t last = words[input] & 0xfffffu;
+                    packed[output + 0] = static_cast<uint8_t>(last);
+                    packed[output + 1] = static_cast<uint8_t>(last >> 8);
+                    packed[output + 2] = static_cast<uint8_t>(last >> 16);
+                }
+                wire = packed.data();
+                wireBytes = packed.size();
+            } else {
+                const uint16_t endianProbe = 1;
+                const bool littleEndian =
+                    *reinterpret_cast<const uint8_t *>(&endianProbe) == 1;
+                if (littleEndian) {
+                    wire = reinterpret_cast<const uint8_t *>(words.data());
+                } else {
+                    packed.resize(words.size() * sizeof(uint32_t));
+                    for (std::size_t i = 0; i < words.size(); ++i)
+                        putLe32(packed.data() + i * sizeof(uint32_t), words[i]);
+                    wire = packed.data();
+                }
+                wireBytes = words.size() * sizeof(uint32_t);
+            }
+            for (std::size_t offset = 0; offset < wireBytes;) {
                 const std::size_t count = std::min(
-                    USB_TX_TRANSFER_BYTES / sizeof(uint32_t),
-                    words.size() - offset);
-                std::vector<uint8_t> payload(count * sizeof(uint32_t));
-                for (std::size_t i = 0; i < count; ++i)
-                    putLe32(payload.data() + i * sizeof(uint32_t),
-                            words[offset + i]);
+                    USB_TX_TRANSFER_BYTES, wireBytes - offset);
 
                 const int64_t remainingMs =
                     std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -2190,11 +2254,12 @@ private:
                     std::min<int64_t>(remainingMs, USB_CTRL_TIMEOUT_MS));
                 int transferred = 0;
                 const int status = libusb_bulk_transfer(
-                    _usb->handle, USB_EP_TX_OUT, payload.data(),
-                    static_cast<int>(payload.size()), &transferred,
+                    _usb->handle, USB_EP_TX_OUT,
+                    const_cast<uint8_t *>(wire + offset),
+                    static_cast<int>(count), &transferred,
                     transferTimeout);
                 if (status != 0 ||
-                    transferred != static_cast<int>(payload.size())) {
+                    transferred != static_cast<int>(count)) {
                     throw std::runtime_error(
                         std::string("USB TX data write failed: ") +
                         libusb_error_name(status));
@@ -2469,8 +2534,23 @@ private:
             if (receiveAck(std::min(remainingMs, 25), received, committed)) {
                 if (committed) return finishCommitted();
                 if (received >= windowEnd) {
-                    resumeOffset = windowEnd;
-                    recovery = false;
+                    if (windowEnd == words.size()) {
+                        /* All payload can arrive while the realtime chain's
+                         * single continuation slot is still occupied. The
+                         * firmware ACKs the complete bitmap with committed=0;
+                         * replay the idempotent final datagram until its
+                         * try-commit handoff succeeds. */
+                        resumeOffset =
+                            ((words.size() - 1) /
+                             TX_UDP_WORDS_PER_DATAGRAM) *
+                            TX_UDP_WORDS_PER_DATAGRAM;
+                        recovery = true;
+                        std::this_thread::sleep_for(
+                            std::chrono::milliseconds(1));
+                    } else {
+                        resumeOffset = windowEnd;
+                        recovery = false;
+                    }
                     continue;
                 }
             }
