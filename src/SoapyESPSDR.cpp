@@ -72,16 +72,18 @@ constexpr uint32_t IQ_AGC_GAIN_CHANGES_MASK = 0xffffu;
 constexpr std::size_t TX_UDP_HEADER_BYTES = 36;
 constexpr std::size_t TX_UDP_ACK_BYTES = 40;
 constexpr std::size_t TX_UDP_WORDS_PER_DATAGRAM = 350;
+constexpr std::size_t TX_UDP_PACKED20_WORDS_PER_DATAGRAM = 560;
 constexpr std::size_t TX_UDP_ACK_WINDOW_DATAGRAMS = 256;
 constexpr std::size_t TX_UDP_PACING_BURST_DATAGRAMS = 16;
 constexpr std::size_t TX_REPLAY_SEGMENT_SAMPLES = 16383;
 constexpr std::size_t TX_REPLAY_MAX_SAMPLES = TX_REPLAY_SEGMENT_SAMPLES * 64;
-constexpr std::size_t TX_STREAM_BATCH_SAMPLES = 524288;
+constexpr std::size_t TX_STREAM_BATCH_SAMPLES_USB = 524'288;
+constexpr std::size_t TX_STREAM_BATCH_SAMPLES_ETHERNET = 1'048'320;
 constexpr uint16_t TX_UDP_FLAG_AUTOSTART = 1u << 8;
 constexpr unsigned TX_UDP_RATE_CODE_SHIFT = 9;
 constexpr uint16_t TX_UDP_FLAG_MORE = 1u << 13;
 constexpr uint16_t TX_UDP_FLAG_CONTINUE = 1u << 14;
-constexpr uint16_t TX_USB_FLAG_PACKED20 = 1u << 15;
+constexpr uint16_t TX_FLAG_PACKED20 = 1u << 15;
 constexpr unsigned STREAM_SELECTION_MAX = 1'000'000;
 constexpr uint32_t S31_ADC_SOURCE_MUX_MASK = 0x0000000fu;
 constexpr std::size_t REAL_TIMING_TAPS = 25;
@@ -205,6 +207,32 @@ void putLe64(uint8_t *p, uint64_t value)
 {
     putLe32(p, static_cast<uint32_t>(value));
     putLe32(p + 4, static_cast<uint32_t>(value >> 32));
+}
+
+std::vector<uint8_t> packIq10Words20(const std::vector<uint32_t> &words)
+{
+    std::vector<uint8_t> packed((words.size() * 5 + 1) / 2);
+    std::size_t output = 0;
+    std::size_t input = 0;
+    while (input + 1 < words.size()) {
+        const uint32_t first = words[input] & 0xfffffu;
+        const uint32_t second = words[input + 1] & 0xfffffu;
+        packed[output + 0] = static_cast<uint8_t>(first);
+        packed[output + 1] = static_cast<uint8_t>(first >> 8);
+        packed[output + 2] = static_cast<uint8_t>(
+            (first >> 16) | (second << 4));
+        packed[output + 3] = static_cast<uint8_t>(second >> 4);
+        packed[output + 4] = static_cast<uint8_t>(second >> 12);
+        input += 2;
+        output += 5;
+    }
+    if (input < words.size()) {
+        const uint32_t last = words[input] & 0xfffffu;
+        packed[output + 0] = static_cast<uint8_t>(last);
+        packed[output + 1] = static_cast<uint8_t>(last >> 8);
+        packed[output + 2] = static_cast<uint8_t>(last >> 16);
+    }
+    return packed;
 }
 
 int16_t signExtend10(uint32_t value)
@@ -767,6 +795,7 @@ public:
             _haveHardwareTime = true;
         }
         _txUdpAutostart = status.get("tx_udp_autostart", false).asBool();
+        _txUdpPacked20 = status.get("tx_udp_packed20", false).asBool();
         const Json::Value gain = status["manual_rx_gain"];
         if (gain.isObject() && gain["unit"].asString() == "dB") {
             _gainMin = gain.get("minimum", 0.0).asDouble();
@@ -1377,7 +1406,9 @@ public:
     std::size_t getStreamMTU(SoapySDR::Stream *stream) const override
     {
         const auto *state = checkedStream(stream);
-        if (state->direction == SOAPY_SDR_TX) return TX_STREAM_BATCH_SAMPLES;
+        if (state->direction == SOAPY_SDR_TX)
+            return _usb != nullptr ? TX_STREAM_BATCH_SAMPLES_USB
+                                   : TX_STREAM_BATCH_SAMPLES_ETHERNET;
         /* Host reads can aggregate multiple native IQC8 frames, so retain the
          * established 2048-complex-sample block as the public MTU on either
          * transport. */
@@ -1405,7 +1436,9 @@ public:
                 std::scoped_lock lock(state->mutex, state->txWriteMutex);
                 state->txBurstStatuses.clear();
                 state->txPendingWords.clear();
-                state->txPendingWords.reserve(TX_STREAM_BATCH_SAMPLES);
+                state->txPendingWords.reserve(
+                    _usb != nullptr ? TX_STREAM_BATCH_SAMPLES_USB
+                                    : TX_STREAM_BATCH_SAMPLES_ETHERNET);
                 state->txBufferedSamples = 0;
                 state->txPendingHasTime = false;
                 state->txPendingStartTimeNs = 0;
@@ -1719,7 +1752,10 @@ public:
              * or the application closes the burst. This makes every earlier
              * commit unambiguously MORE while guaranteeing that END_BURST or
              * deactivate can commit a real final (non-MORE) batch. */
-            if (state->txPendingWords.size() == TX_STREAM_BATCH_SAMPLES &&
+            const std::size_t batchSamples =
+                _usb != nullptr ? TX_STREAM_BATCH_SAMPLES_USB
+                                : TX_STREAM_BATCH_SAMPLES_ETHERNET;
+            if (state->txPendingWords.size() == batchSamples &&
                 numElems != 0) {
                 if (txContinuationExpired(state)) {
                     state->txPendingWords.clear();
@@ -1762,7 +1798,7 @@ public:
                 state->txPendingStartTimeNs = timeNs;
             }
             const std::size_t available =
-                TX_STREAM_BATCH_SAMPLES - state->txPendingWords.size();
+                batchSamples - state->txPendingWords.size();
             count = std::min(numElems, available);
             for (std::size_t i = 0; i < count; ++i) {
                 int32_t iv = 0;
@@ -1812,7 +1848,8 @@ public:
                 const Json::Value replay = statusSnapshot()["tx_replay"];
                 const unsigned completedRateCode = txRateCode(_txSampleRate);
                 const bool tcmStaged =
-                    completedRateCode == 14 || completedRateCode == 15;
+                    completedRateCode == 14 || completedRateCode == 15 ||
+                    (_usb == nullptr && _txUdpPacked20);
                 const bool underflow =
                     replay.get("queue_underflow", false).asBool() ||
                     replay.get("deadline_missed", false).asBool() ||
@@ -2189,7 +2226,7 @@ private:
                 static_cast<uint16_t>(rateCode << TX_UDP_RATE_CODE_SHIFT);
             if (more) commitFlags |= TX_UDP_FLAG_MORE;
             if (continuation) commitFlags |= TX_UDP_FLAG_CONTINUE;
-            if (packed20) commitFlags |= TX_USB_FLAG_PACKED20;
+            if (packed20) commitFlags |= TX_FLAG_PACKED20;
         }
         putLe16(arm.data() + 4, commitFlags);
         putLe64(arm.data() + 8, static_cast<uint64_t>(startTimeNs));
@@ -2208,27 +2245,7 @@ private:
             const uint8_t *wire = nullptr;
             std::size_t wireBytes = 0;
             if (packed20) {
-                packed.resize((words.size() * 5 + 1) / 2);
-                std::size_t output = 0;
-                std::size_t input = 0;
-                while (input + 1 < words.size()) {
-                    const uint32_t first = words[input] & 0xfffffu;
-                    const uint32_t second = words[input + 1] & 0xfffffu;
-                    packed[output + 0] = static_cast<uint8_t>(first);
-                    packed[output + 1] = static_cast<uint8_t>(first >> 8);
-                    packed[output + 2] = static_cast<uint8_t>(
-                        (first >> 16) | (second << 4));
-                    packed[output + 3] = static_cast<uint8_t>(second >> 4);
-                    packed[output + 4] = static_cast<uint8_t>(second >> 12);
-                    input += 2;
-                    output += 5;
-                }
-                if (input < words.size()) {
-                    const uint32_t last = words[input] & 0xfffffu;
-                    packed[output + 0] = static_cast<uint8_t>(last);
-                    packed[output + 1] = static_cast<uint8_t>(last >> 8);
-                    packed[output + 2] = static_cast<uint8_t>(last >> 16);
-                }
+                packed = packIq10Words20(words);
                 wire = packed.data();
                 wireBytes = packed.size();
             } else {
@@ -2340,9 +2357,17 @@ private:
                                     continuation);
         }
 
+        const bool packed20 = _txUdpAutostart && _txUdpPacked20;
+        /* Convert before arming the short-lived firmware upload session. The
+         * 560-sample packet geometry is even, so one whole-batch packing is
+         * byte-identical to independently packing each datagram. */
+        const std::vector<uint8_t> packed = packed20
+            ? packIq10Words20(words) : std::vector<uint8_t>{};
+
         std::lock_guard<std::mutex> controlLock(_controlMutex);
         Json::Value armRequest(Json::objectValue);
         armRequest["word_count"] = Json::UInt64(words.size());
+        armRequest["packed20"] = packed20;
         if (startTimeNs != 0)
             armRequest["start_time_ns"] = Json::Int64(startTimeNs);
         const Json::Value arm = _control->post(
@@ -2404,6 +2429,12 @@ private:
         const auto timeout = std::chrono::microseconds(
             std::max<long>(timeoutUs, 10'000'000));
         const auto deadline = std::chrono::steady_clock::now() + timeout;
+        const std::size_t samplesPerDatagram = packed20
+            ? TX_UDP_PACKED20_WORDS_PER_DATAGRAM
+            : TX_UDP_WORDS_PER_DATAGRAM;
+        const std::size_t flightDatagrams = packed20
+            ? TX_UDP_PACING_BURST_DATAGRAMS / 4
+            : TX_UDP_PACING_BURST_DATAGRAMS;
         std::size_t resumeOffset = 0;
 
         auto receiveAck = [&](int waitMs, std::size_t &received,
@@ -2455,21 +2486,20 @@ private:
         };
 
         bool recovery = false;
-        std::array<uint8_t, TX_UDP_HEADER_BYTES +
-                                TX_UDP_WORDS_PER_DATAGRAM * 4> packet{};
+        std::array<uint8_t, TX_UDP_HEADER_BYTES + 1400> packet{};
         while (resumeOffset < words.size() &&
                std::chrono::steady_clock::now() < deadline) {
             const std::size_t windowStart = resumeOffset;
             const std::size_t windowEnd = std::min(
                 words.size(), windowStart +
                     TX_UDP_ACK_WINDOW_DATAGRAMS *
-                    TX_UDP_WORDS_PER_DATAGRAM);
+                    samplesPerDatagram);
             const bool reset = windowStart == 0;
             auto pacingDeadline = std::chrono::steady_clock::now();
             for (std::size_t offset = windowStart; offset < windowEnd;
-                 offset += TX_UDP_WORDS_PER_DATAGRAM) {
+                 offset += samplesPerDatagram) {
                 const std::size_t count = std::min(
-                    TX_UDP_WORDS_PER_DATAGRAM, words.size() - offset);
+                    samplesPerDatagram, words.size() - offset);
                 const bool final = offset + count == words.size();
                 const bool windowFinal = offset + count >= windowEnd;
                 std::memcpy(packet.data(), "IQT1", 4);
@@ -2478,12 +2508,13 @@ private:
                 putLe32(packet.data() + 8, token);
                 putLe32(packet.data() + 12, batch);
                 putLe32(packet.data() + 16,
-                        static_cast<uint32_t>(offset / TX_UDP_WORDS_PER_DATAGRAM));
+                        static_cast<uint32_t>(offset / samplesPerDatagram));
                 putLe32(packet.data() + 20, static_cast<uint32_t>(offset));
                 putLe16(packet.data() + 24, static_cast<uint16_t>(count));
                 uint16_t packetFlags = (reset && offset == 0 ? 1u : 0u) |
                                        (final ? 2u : 0u) |
-                                       (windowFinal ? 4u : 0u);
+                                       (windowFinal ? 4u : 0u) |
+                                       (packed20 ? TX_FLAG_PACKED20 : 0u);
                 if (final && _txUdpAutostart) {
                     packetFlags |= TX_UDP_FLAG_AUTOSTART |
                         static_cast<uint16_t>(txRateCode(_txSampleRate)
@@ -2497,14 +2528,21 @@ private:
                 putLe32(packet.data() + 32,
                         static_cast<uint32_t>(crc32(0, packet.data(), 32)));
                 uint8_t *payload = packet.data() + TX_UDP_HEADER_BYTES;
+                std::size_t payloadBytes = count * 4;
+                if (packed20) {
+                    payloadBytes = (count * 5 + 1) / 2;
+                    std::memcpy(payload, packed.data() + offset * 5 / 2,
+                                payloadBytes);
+                } else {
 #if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
-                std::memcpy(payload, words.data() + offset, count * 4);
+                    std::memcpy(payload, words.data() + offset, count * 4);
 #else
-                for (std::size_t i = 0; i < count; ++i)
-                    putLe32(payload + i * 4, words[offset + i]);
+                    for (std::size_t i = 0; i < count; ++i)
+                        putLe32(payload + i * 4, words[offset + i]);
 #endif
+                }
                 const std::size_t packetBytes =
-                    TX_UDP_HEADER_BYTES + count * 4;
+                    TX_UDP_HEADER_BYTES + payloadBytes;
                 if (::send(socketFd, packet.data(), packetBytes, 0) !=
                     static_cast<ssize_t>(packetBytes))
                     throw std::runtime_error("TX UDP send failed");
@@ -2519,8 +2557,8 @@ private:
                 // radio sample rate on a normal desktop kernel.
                 pacingDeadline += std::chrono::microseconds(recovery ? 75 : 65);
                 const std::size_t flightPacket =
-                    (offset - windowStart) / TX_UDP_WORDS_PER_DATAGRAM + 1;
-                if (flightPacket % TX_UDP_PACING_BURST_DATAGRAMS == 0 ||
+                    (offset - windowStart) / samplesPerDatagram + 1;
+                if (flightPacket % flightDatagrams == 0 ||
                     windowFinal) {
                     while (std::chrono::steady_clock::now() < pacingDeadline) {
                         // A full 2 MiB batch occupies one host core for about
@@ -2546,8 +2584,7 @@ private:
                          * try-commit handoff succeeds. */
                         resumeOffset =
                             ((words.size() - 1) /
-                             TX_UDP_WORDS_PER_DATAGRAM) *
-                            TX_UDP_WORDS_PER_DATAGRAM;
+                             samplesPerDatagram) * samplesPerDatagram;
                         recovery = true;
                         std::this_thread::sleep_for(
                             std::chrono::milliseconds(1));
@@ -2559,7 +2596,7 @@ private:
                 }
             }
             if (received < windowEnd &&
-                received % TX_UDP_WORDS_PER_DATAGRAM == 0) {
+                received % samplesPerDatagram == 0) {
                 resumeOffset = received;
                 recovery = true;
             } else {
@@ -3558,6 +3595,7 @@ private:
     double _gainStep = 1.0;
     double _txSampleRate = 4e6;
     bool _txUdpAutostart = false;
+    bool _txUdpPacked20 = false;
     StreamState *_rxStream = nullptr;
     StreamState *_txStream = nullptr;
 };
