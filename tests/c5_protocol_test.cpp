@@ -23,8 +23,8 @@ int main() {
         auto send=[&](const std::string &s){require(::write(master,s.data(),s.size())==ssize_t(s.size()),"emulator write");};
         require(line().empty(),"synchronization boundary");
         auto sync=line();require(sync.rfind("SYNC ",0)==0,"synchronization request");
-        send("old data\nC5SDR 3 burst 16380\n"+sync+"\n");
-        require(line()=="INFO","identity query");send("C5SDR 3 burst 16380\n");
+        send("old data\nC5SDR 4 burst 16380\n"+sync+"\n");
+        require(line()=="INFO","identity query");send("C5SDR 4 burst 16380\n");
         require(line()=="FREQ 2412","initial tune");send("OK\n");
         std::string wire(256*5/2,'\0');
         // I=-512, Q=-512 -> canonical RX (-1,+1). Includes binary newline.

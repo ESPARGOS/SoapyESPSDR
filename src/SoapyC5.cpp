@@ -27,6 +27,7 @@ class C5Device final : public SoapySDR::Device {
     double rates[2]={1000000,80000000};
     double frequency=2412000000;
     bool failed=false;
+    unsigned txRepeats=1;
     static void channel(int dir,size_t ch) {
         if((dir!=SOAPY_SDR_RX && dir!=SOAPY_SDR_TX)||ch)throw std::runtime_error("C5: invalid channel");
     }
@@ -60,14 +61,32 @@ public:
         if(identity=="ERR command" || identity=="ERR command_length") {
             port.command("INFO",end);identity=port.line(end);
         }
-        if(identity!="C5SDR 3 burst 16380")throw std::runtime_error("C5: protocol-3 firmware required");
+        if(identity!="C5SDR 4 burst 16380")throw std::runtime_error("C5: protocol-4 firmware required");
         port.command("FREQ 2412",end);
         if(port.line(end)!="OK")throw std::runtime_error("C5: initial tune failed");
     }
     std::string getDriverKey() const override{return "espsdr";}
     std::string getHardwareKey() const override{return "ESP32-C5";}
     SoapySDR::Kwargs getHardwareInfo() const override {
-        return {{"transport","USB Serial/JTAG"},{"mode","finite burst, half duplex"},{"protocol","3"}};
+        return {{"transport","USB Serial/JTAG"},{"mode","finite burst, half duplex"},{"protocol","4"}};
+    }
+    SoapySDR::ArgInfoList getSettingInfo() const override {
+        SoapySDR::ArgInfo a;a.key="TX_REPEATS";a.value="1";
+        a.name="TX buffer repetitions";a.type=SoapySDR::ArgInfo::INT;
+        a.description="Repeat each uploaded TX buffer 1–255 times; total playback must be at most 100 ms.";
+        a.range=SoapySDR::Range(1,255,1);return {a};
+    }
+    void writeSetting(const std::string &key,const std::string &value) override {
+        std::lock_guard<std::mutex> lock(mutex);idle();
+        if(key!="TX_REPEATS")throw std::runtime_error("C5: unknown setting");
+        size_t used=0;unsigned long n=std::stoul(value,&used);
+        if(used!=value.size()||n<1||n>255)throw std::runtime_error("C5: TX_REPEATS must be 1–255");
+        txRepeats=unsigned(n);
+    }
+    std::string readSetting(const std::string &key) const override {
+        std::lock_guard<std::mutex> lock(mutex);
+        if(key!="TX_REPEATS")throw std::runtime_error("C5: unknown setting");
+        return std::to_string(txRepeats);
     }
     size_t getNumChannels(int) const override{return 1;}
     bool getFullDuplex(int,size_t) const override{return false;}
@@ -96,7 +115,7 @@ public:
     double getFrequency(int d,size_t c,const std::string &) const override{return getFrequency(d,c);}
     std::vector<double> listSampleRates(int d,size_t c) const override {
         channel(d,c);
-        if(d==SOAPY_SDR_TX)return {250000,500000,1000000,2000000,3000000,4000000,6000000};
+        if(d==SOAPY_SDR_TX)return {250000,500000,1000000,2000000,3000000,4000000,6000000,40000000,80000000};
         return {4000000,8000000,10000000,20000000,40000000,80000000};
     }
     SoapySDR::RangeList getSampleRateRange(int d,size_t c) const override {
@@ -163,6 +182,7 @@ public:
         std::lock_guard<std::mutex> lock(mutex);auto &b=get(s);
         if(failed||!b.active||b.direction!=SOAPY_SDR_TX)return SOAPY_SDR_STREAM_ERROR;
         if(flags!=SOAPY_SDR_END_BURST || !n || n>capacity || (b.requested&&n!=b.requested))return SOAPY_SDR_NOT_SUPPORTED;
+        if(n*txRepeats>size_t(rates[SOAPY_SDR_TX]/10))return SOAPY_SDR_NOT_SUPPORTED;
         std::vector<uint32_t> words(n);
         for(size_t j=0;j<n;j++) {
             float i,q;
@@ -175,15 +195,17 @@ public:
         auto wire=c5PackIQ(words);
         try {
             auto end=deadline(timeoutUs);std::ostringstream cmd;
-            cmd<<"TX20 "<<n<<" "<<unsigned(rates[SOAPY_SDR_TX])<<" "<<std::hex<<crc32(0,wire.data(),wire.size());
+            cmd<<(txRepeats==1?"TX20 ":"LOOP20 ")<<n<<" "<<unsigned(rates[SOAPY_SDR_TX])<<" ";
+            if(txRepeats!=1)cmd<<txRepeats<<" ";
+            cmd<<std::hex<<crc32(0,wire.data(),wire.size());
             port.command(cmd.str(),end);
             if(port.line(end)!="READY")throw std::runtime_error("C5: TX rejected");
             port.write(wire.data(),wire.size(),end);
             std::istringstream h(port.line(end));std::string tag;size_t sent;uint32_t cycles,late;
-            if(!(h>>tag>>sent>>cycles>>late)||tag!="SENT"||sent!=n)throw std::runtime_error("C5: TX failed");
+            if(!(h>>tag>>sent>>cycles>>late)||tag!="SENT"||sent!=n*txRepeats)throw std::runtime_error("C5: TX failed");
             b.active=false;
             if(late>=240000000u/unsigned(rates[SOAPY_SDR_TX]))return SOAPY_SDR_UNDERFLOW;
-            return int(sent);
+            return int(n);
         }catch(const std::exception &e){failed=true;b.active=false;SoapySDR::log(SOAPY_SDR_ERROR,e.what());return SOAPY_SDR_STREAM_ERROR;}
     }
 };

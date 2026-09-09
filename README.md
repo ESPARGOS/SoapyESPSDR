@@ -4,13 +4,13 @@
 
 Select the C5 explicitly with `driver=espsdr,serial=/dev/ttyACM0` on this PC.
 The port can change after a watchdog reset; match USB serial `3C:DC:75:88:C2:70`.
-It uses USB Serial/JTAG and protocol-3 firmware from the companion
+It uses USB Serial/JTAG and protocol-4 firmware from the companion
 `direct_iq_test` repository. RX rates are 4, 8, 10, 20, 40, and 80 MS/s;
-TX rates are 0.25, 0.5, 1, 2, 3, 4, and 6 MS/s. Both support CF32 and CS16.
+TX rates are 0.25, 0.5, 1, 2, 3, 4, 6, 40, and 80 MS/s. Both support CF32 and CS16.
 These are **finite, half-duplex bursts**, with at most 16,380 complex samples.
 USB uses lossless 20-bit IQ packing (two samples per five bytes), CRC protection,
 and a nonce-based synchronization handshake. Update firmware and driver together;
-the previous protocol-2 pair is incompatible. Average USB throughput is much lower
+previous protocol versions are incompatible. Average USB throughput is much lower
 than the RF clock rate; see the report for measured improvements.
 
 RX requires `activateStream(rx, 0, 0, sample_count)` with 256–16,380 samples.
@@ -20,9 +20,17 @@ unmeasured gap between snapshots. Continuous activation is rejected.
 
 TX requires activation, followed by one `writeStream` of at most 16,380 samples
 with `SOAPY_SDR_END_BURST`. Use a timeout of at least one second for full bursts.
+For finite cyclic playback, set `writeSetting("TX_REPEATS", "255")` while
+inactive before submitting a buffer. The repeat count is 1–255, defaults to 1,
+and total playback must be at most 100 ms. A write returns the uploaded buffer
+length. At 40/80 MS/s, the private modem DMA reads the buffer; lower rates use
+the CPU. A full buffer repeated 255 times at 80 MS/s plays for 52.21125 ms.
+The companion `direct_iq_test/doc/esp32c5-performance.html` contains the complete
+report with plots and the limits of the 100 MHz–6 GHz command sweep.
+
 Timed streams, continuous streaming, full duplex, adjustable gain, and hardware
 timestamps are unavailable. The LO is shared and tunes in 1 MHz steps from
-2402 to 2482 MHz; only a subset has been RF tested. Deactivate streams before
+2402 to 2482 MHz; every 1 MHz step has been RF tested with the B210. Deactivate streams before
 changing settings. A transport/CRC failure invalidates the device instance;
 close it, wait at least three seconds for the firmware upload timeout, and reopen.
 

@@ -62,3 +62,17 @@ if a.tx:
   assert d.writeStream(tx,[b],4096,S.SOAPY_SDR_END_BURST,timeoutUs=1000000).ret==4096
   print('CS16 TX: 4096 samples passed')
  finally:d.closeStream(tx)
+
+if a.tx:
+ tx=d.setupStream(S.SOAPY_SDR_TX,S.SOAPY_SDR_CF32)
+ try:
+  for rate in (6000000,40000000,80000000):
+   d.setSampleRate(S.SOAPY_SDR_TX,0,rate)
+   d.writeSetting('TX_REPEATS','16')
+   assert d.readSetting('TX_REPEATS')=='16'
+   z=(.2*np.exp(2j*np.pi*np.arange(4096)/256)).astype(np.complex64)
+   assert d.activateStream(tx)==0
+   assert d.writeStream(tx,[z],4096,S.SOAPY_SDR_END_BURST,timeoutUs=1000000).ret==4096
+  d.writeSetting('TX_REPEATS','1')
+  print('Cyclic TX: 16 repeats at 6, 40 and 80 MS/s passed')
+ finally:d.closeStream(tx)
