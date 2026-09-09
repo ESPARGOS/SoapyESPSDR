@@ -11,7 +11,7 @@ pkg_check_modules(LIBUSB REQUIRED IMPORTED_TARGET libusb-1.0)
 
 SOAPY_SDR_MODULE_UTIL(
     TARGET ESPSDRSupport
-    SOURCES src/SoapyESPSDR.cpp
+    SOURCES src/SoapyESPSDR.cpp src/SoapyC5.cpp
     LIBRARIES CURL::libcurl PkgConfig::JSONCPP ZLIB::ZLIB PkgConfig::LIBUSB
 )
 
@@ -26,6 +26,20 @@ install(TARGETS espsdr_loss_monitor RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 option(ESPSDR_BUILD_TESTS "Build the SoapyESPSDR live hardware tests" ON)
 if(ESPSDR_BUILD_TESTS)
     enable_testing()
+    if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+        find_package(Threads REQUIRED)
+        add_executable(espsdr_c5_serial_test tests/c5_serial_test.cpp)
+        target_compile_features(espsdr_c5_serial_test PRIVATE cxx_std_17)
+        target_include_directories(espsdr_c5_serial_test PRIVATE src)
+        target_link_libraries(espsdr_c5_serial_test PRIVATE util Threads::Threads)
+        add_test(NAME espsdr_c5_serial COMMAND espsdr_c5_serial_test)
+        add_executable(espsdr_c5_protocol_test tests/c5_protocol_test.cpp src/SoapyC5.cpp)
+        target_compile_features(espsdr_c5_protocol_test PRIVATE cxx_std_17)
+        target_include_directories(espsdr_c5_protocol_test PRIVATE src)
+        target_link_libraries(espsdr_c5_protocol_test PRIVATE SoapySDR ZLIB::ZLIB util Threads::Threads)
+        add_test(NAME espsdr_c5_protocol COMMAND espsdr_c5_protocol_test)
+        set_tests_properties(espsdr_c5_protocol espsdr_c5_serial PROPERTIES TIMEOUT 10)
+    endif()
     add_executable(espsdr_smoke_test tests/smoke_test.cpp)
     target_compile_features(espsdr_smoke_test PRIVATE cxx_std_17)
     target_link_libraries(espsdr_smoke_test PRIVATE SoapySDR)

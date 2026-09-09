@@ -1,5 +1,47 @@
 # SoapyESPSDR
 
+## ESP32-C5 on this branch
+
+Select the C5 explicitly with `driver=espsdr,serial=/dev/ttyACM2` on this PC.
+The port can change after a watchdog reset; match USB serial `3C:DC:75:88:C2:70`.
+It uses USB Serial/JTAG and protocol-2 firmware from the companion
+`direct_iq_test` repository. RX rates are 4, 8, 10, 20, 40, and 80 MS/s;
+TX rates are 0.25, 0.5, 1, and 2 MS/s. Both support CF32 and CS16.
+These are **finite, half-duplex bursts**, with at most 16,380 complex samples.
+Average USB throughput is much lower than the RF clock rate.
+
+RX requires `activateStream(rx, 0, 0, sample_count)` with 256–16,380 samples.
+`readStream` may split that capture across calls and marks its last fragment
+`SOAPY_SDR_END_BURST`. Activate again to capture another snapshot; there is an
+unmeasured gap between snapshots. Continuous activation is rejected.
+
+TX requires activation, followed by one `writeStream` of at most 16,380 samples
+with `SOAPY_SDR_END_BURST`. Use a timeout of at least one second for full bursts.
+Timed streams, continuous streaming, full duplex, adjustable gain, and hardware
+timestamps are unavailable. The LO is shared and tunes in 1 MHz steps from
+2402 to 2482 MHz; only a subset has been RF tested. Deactivate streams before
+changing settings. A transport/CRC failure invalidates the device instance;
+close it, wait at least three seconds for the firmware upload timeout, and reopen.
+
+Build with the normal CMake instructions below. To test a local module while
+an older module is installed:
+
+```sh
+export SOAPY_SDR_ROOT=/tmp/c5-soapy-isolated
+export SOAPY_SDR_PLUGIN_PATH="$PWD/build-c5"
+SoapySDRUtil --probe="driver=espsdr,serial=/dev/ttyACM2"
+python3 tests/c5_live_test.py --port /dev/ttyACM2 --tx
+```
+
+The Python live test requires numpy and the SoapySDR Python bindings. `--tx`
+emits RF; omit it for RX-only checks. Use the string device constructor, e.g.
+`SoapySDR.Device("driver=espsdr,serial=/dev/ttyACM2")`.
+
+See the companion [C5 report](../direct_iq_test/doc/esp32c5.md) for build/flash
+instructions, measurements, RF validation, and remaining limitations.
+
+## ESP32-S31
+
 <a href="https://espargos.net/"><img src="assets/espargos-logo.png" alt="ESPARGOS" width="40%" align="right"></a>
 
 SoapyESPSDR is a SoapySDR transceiver driver for ESP-SDR by

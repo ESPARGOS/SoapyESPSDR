@@ -1,3 +1,4 @@
+#include "SoapyC5.hpp"
 #include <SoapySDR/Device.hpp>
 #include <SoapySDR/Errors.hpp>
 #include <SoapySDR/Formats.hpp>
@@ -4099,6 +4100,7 @@ SoapySDR::KwargsList findEspSdr(const SoapySDR::Kwargs &args)
     const auto driver = args.find("driver");
     if (driver != args.end() && driver->second != "espsdr") return {};
 
+    if (args.count("serial")) return findC5(args);
     SoapySDR::KwargsList results;
     const auto usbArg = args.find("usb");
     const auto usbSerialArg = args.find("usb_serial");
@@ -4136,7 +4138,7 @@ SoapySDR::KwargsList findEspSdr(const SoapySDR::Kwargs &args)
     return results;
 }
 
-SoapySDR::Device *makeEspSdr(const SoapySDR::Kwargs &args) { return new EspDevice(args); }
+SoapySDR::Device *makeEspSdr(const SoapySDR::Kwargs &args) { return args.count("serial") ? makeC5(args) : new EspDevice(args); }
 static SoapySDR::Registry registerEspSdr("espsdr", &findEspSdr, &makeEspSdr, SOAPY_SDR_ABI_VERSION);
 
 } // namespace
