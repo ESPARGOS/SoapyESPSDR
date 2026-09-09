@@ -1,5 +1,6 @@
 #include "SoapyC5.hpp"
 #include "C5Serial.hpp"
+#include "C5IQ.hpp"
 #include <SoapySDR/Formats.hpp>
 #include <SoapySDR/Errors.hpp>
 #include <SoapySDR/Logger.hpp>
@@ -43,20 +44,30 @@ class C5Device final : public SoapySDR::Device {
     }
 public:
     explicit C5Device(const SoapySDR::Kwargs &args):port(args.at("serial")) {
-        auto end=deadline();port.command("INFO",end);
+        auto end=deadline();
+        const auto token=std::to_string(C5Serial::Clock::now().time_since_epoch().count());
+        port.command("\nSYNC "+token,end);
+        const std::string marker="SYNC "+token+"\n";
+        std::string window;
+        for(size_t bytes=0;window!=marker;bytes++) {
+            if(bytes>=70000)throw std::runtime_error("C5: synchronization failed");
+            char c;port.read(&c,1,end);window+=c;
+            if(window.size()>marker.size())window.erase(0,1);
+        }
+        port.command("INFO",end);
         auto identity=port.line(end);
         // A ROM-to-app transition can leave a partial command in the FIFO.
         if(identity=="ERR command" || identity=="ERR command_length") {
             port.command("INFO",end);identity=port.line(end);
         }
-        if(identity!="C5SDR 2 burst 16380")throw std::runtime_error("C5: protocol-2 firmware required");
+        if(identity!="C5SDR 3 burst 16380")throw std::runtime_error("C5: protocol-3 firmware required");
         port.command("FREQ 2412",end);
         if(port.line(end)!="OK")throw std::runtime_error("C5: initial tune failed");
     }
     std::string getDriverKey() const override{return "espsdr";}
     std::string getHardwareKey() const override{return "ESP32-C5";}
     SoapySDR::Kwargs getHardwareInfo() const override {
-        return {{"transport","USB Serial/JTAG"},{"mode","finite burst, half duplex"},{"protocol","2"}};
+        return {{"transport","USB Serial/JTAG"},{"mode","finite burst, half duplex"},{"protocol","3"}};
     }
     size_t getNumChannels(int) const override{return 1;}
     bool getFullDuplex(int,size_t) const override{return false;}
@@ -85,7 +96,7 @@ public:
     double getFrequency(int d,size_t c,const std::string &) const override{return getFrequency(d,c);}
     std::vector<double> listSampleRates(int d,size_t c) const override {
         channel(d,c);
-        if(d==SOAPY_SDR_TX)return {250000,500000,1000000,2000000};
+        if(d==SOAPY_SDR_TX)return {250000,500000,1000000,2000000,3000000,4000000,6000000};
         return {4000000,8000000,10000000,20000000,40000000,80000000};
     }
     SoapySDR::RangeList getSampleRateRange(int d,size_t c) const override {
@@ -128,13 +139,12 @@ public:
                 auto end=deadline(timeoutUs);unsigned div=0;
                 const double clocks[]={80000000,40000000,20000000,10000000,8000000,4000000};
                 while(clocks[div]!=rates[SOAPY_SDR_RX])++div;
-                port.command("CAP "+std::to_string(b.requested)+" "+std::to_string(div),end);
+                port.command("CAP20 "+std::to_string(b.requested)+" "+std::to_string(div),end);
                 std::istringstream h(port.line(end));std::string tag;size_t count;uint32_t crc,us;
                 if(!(h>>tag>>count>>std::hex>>crc>>std::dec>>us)||tag!="DATA"||count!=b.requested)throw std::runtime_error("C5: invalid capture header");
-                std::vector<uint8_t> wire(count*4);port.read(wire.data(),wire.size(),end);
+                std::vector<uint8_t> wire((count*20+7)/8);port.read(wire.data(),wire.size(),end);
                 if(crc32(0,wire.data(),wire.size())!=crc)throw std::runtime_error("C5: capture CRC mismatch");
-                b.words.resize(count);
-                for(size_t j=0;j<count;j++)b.words[j]=uint32_t(wire[4*j])|(uint32_t(wire[4*j+1])<<8)|(uint32_t(wire[4*j+2])<<16)|(uint32_t(wire[4*j+3])<<24);
+                b.words=c5UnpackIQ(wire,count);
             }
             n=std::min(n,b.words.size()-b.offset);
             for(size_t j=0;j<n;j++) {
@@ -153,18 +163,19 @@ public:
         std::lock_guard<std::mutex> lock(mutex);auto &b=get(s);
         if(failed||!b.active||b.direction!=SOAPY_SDR_TX)return SOAPY_SDR_STREAM_ERROR;
         if(flags!=SOAPY_SDR_END_BURST || !n || n>capacity || (b.requested&&n!=b.requested))return SOAPY_SDR_NOT_SUPPORTED;
-        std::vector<uint8_t> wire(n*4);
+        std::vector<uint32_t> words(n);
         for(size_t j=0;j<n;j++) {
             float i,q;
             if(b.format==SOAPY_SDR_CF32){auto v=static_cast<const std::complex<float> *>(buffs[0])[j];i=v.real()*512;q=v.imag()*512;}
             else {auto p=static_cast<const int16_t *>(buffs[0]);i=p[2*j]/64.0f;q=p[2*j+1]/64.0f;}
             if(!std::isfinite(i)||!std::isfinite(q))return SOAPY_SDR_STREAM_ERROR;
             uint32_t w=(uint32_t(int(std::round(std::clamp(i,-512.0f,511.0f))))&1023)|((uint32_t(int(std::round(std::clamp(q,-512.0f,511.0f))))&1023)<<10);
-            for(unsigned k=0;k<4;k++)wire[4*j+k]=(w>>(8*k))&255;
+            words[j]=w;
         }
+        auto wire=c5PackIQ(words);
         try {
             auto end=deadline(timeoutUs);std::ostringstream cmd;
-            cmd<<"TX "<<n<<" "<<unsigned(rates[SOAPY_SDR_TX])<<" "<<std::hex<<crc32(0,wire.data(),wire.size());
+            cmd<<"TX20 "<<n<<" "<<unsigned(rates[SOAPY_SDR_TX])<<" "<<std::hex<<crc32(0,wire.data(),wire.size());
             port.command(cmd.str(),end);
             if(port.line(end)!="READY")throw std::runtime_error("C5: TX rejected");
             port.write(wire.data(),wire.size(),end);

@@ -2,13 +2,16 @@
 
 ## ESP32-C5 on this branch
 
-Select the C5 explicitly with `driver=espsdr,serial=/dev/ttyACM2` on this PC.
+Select the C5 explicitly with `driver=espsdr,serial=/dev/ttyACM0` on this PC.
 The port can change after a watchdog reset; match USB serial `3C:DC:75:88:C2:70`.
-It uses USB Serial/JTAG and protocol-2 firmware from the companion
+It uses USB Serial/JTAG and protocol-3 firmware from the companion
 `direct_iq_test` repository. RX rates are 4, 8, 10, 20, 40, and 80 MS/s;
-TX rates are 0.25, 0.5, 1, and 2 MS/s. Both support CF32 and CS16.
+TX rates are 0.25, 0.5, 1, 2, 3, 4, and 6 MS/s. Both support CF32 and CS16.
 These are **finite, half-duplex bursts**, with at most 16,380 complex samples.
-Average USB throughput is much lower than the RF clock rate.
+USB uses lossless 20-bit IQ packing (two samples per five bytes), CRC protection,
+and a nonce-based synchronization handshake. Update firmware and driver together;
+the previous protocol-2 pair is incompatible. Average USB throughput is much lower
+than the RF clock rate; see the report for measured improvements.
 
 RX requires `activateStream(rx, 0, 0, sample_count)` with 256–16,380 samples.
 `readStream` may split that capture across calls and marks its last fragment
@@ -29,13 +32,13 @@ an older module is installed:
 ```sh
 export SOAPY_SDR_ROOT=/tmp/c5-soapy-isolated
 export SOAPY_SDR_PLUGIN_PATH="$PWD/build-c5"
-SoapySDRUtil --probe="driver=espsdr,serial=/dev/ttyACM2"
-python3 tests/c5_live_test.py --port /dev/ttyACM2 --tx
+SoapySDRUtil --probe="driver=espsdr,serial=/dev/ttyACM0"
+python3 tests/c5_live_test.py --port /dev/ttyACM0 --tx
 ```
 
 The Python live test requires numpy and the SoapySDR Python bindings. `--tx`
 emits RF; omit it for RX-only checks. Use the string device constructor, e.g.
-`SoapySDR.Device("driver=espsdr,serial=/dev/ttyACM2")`.
+`SoapySDR.Device("driver=espsdr,serial=/dev/ttyACM0")`.
 
 See the companion [C5 report](../direct_iq_test/doc/esp32c5.md) for build/flash
 instructions, measurements, RF validation, and remaining limitations.
