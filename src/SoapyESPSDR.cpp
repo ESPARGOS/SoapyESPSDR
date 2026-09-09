@@ -2429,7 +2429,7 @@ private:
     const std::vector<double> &txSampleRates() const
     {
         static const std::vector<double> networkRates{
-            4e6, 10e6 / 3.0, 2.5e6, 2e6,
+            40e6 / 9.0, 4e6, 10e6 / 3.0, 2.5e6, 2e6,
         };
         static const std::vector<double> usbRates{
             320e6 / 60.0, 5e6, 40e6 / 9.0, 4e6,
@@ -2637,7 +2637,7 @@ private:
         const uint32_t rateCode = txRateCode(_txSampleRate);
         const bool automaticIq8 =
             _txEthernetWireFormat == TxEthernetWireFormat::Auto &&
-            (rateCode == 9 || rateCode == 10);
+            (rateCode == 9 || rateCode == 10 || rateCode == 11);
         const bool packed16 =
             (_txEthernetWireFormat == TxEthernetWireFormat::Iq8 ||
              automaticIq8);
@@ -2645,7 +2645,8 @@ private:
         /* Convert before arming the short-lived firmware upload session.
          * Capability-negotiated IQ8 is used at 4 and 10/3 MSa/s because its
          * 20% wire and packet-count reduction creates continuity margin on
-         * Ethernet. Rates at or below 2.5 MSa/s keep full IQ10 precision. */
+         * Ethernet. The 40/9 MSa/s mode also requires IQ8 in automatic mode;
+         * rates at or below 2.5 MSa/s keep full IQ10 precision. */
         const std::vector<uint8_t> packed = packed16
             ? packIq10Words16(words)
             : packed20 ? packIq10Words20(words) : std::vector<uint8_t>{};

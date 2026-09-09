@@ -15,6 +15,10 @@ firmware's vendor control and bulk-IQ endpoints. It checks firmware and
 transport sequence numbers and reports any missing samples as SoapySDR
 overflow events.
 
+Ethernet TX supports 40/9, 4, 10/3, 2.5, and 2 MSa/s. Automatic wire-format
+selection uses IQ8 at 40/9, 4, and 10/3 MSa/s to preserve transport margin;
+the lower rates retain IQ10.
+
 The driver and firmware are one current protocol pair. No older combination
 was published, so this checkpoint deliberately omits fallbacks for the
 experimental pre-autostart TX protocol and its status capability flags.
@@ -167,7 +171,7 @@ SOAPY_SDR_PLUGIN_PATH=/home/florian/prgm/esp32/SoapyESPSDR/build gqrx
 - Continuous complex RX at 16 MSa/s divided by an integer from 1 through 10:
   16, 8, 5.333, 4, 3.2, 2.667, 2.286, 2, 1.778, and 1.6 MSa/s
 - Continuous TX rates of 5.333 (320/60), 5, 4.444, 4, 3.333, 2.5, and
-  2 MSa/s over native USB; Ethernet advertises 4, 3.333, 2.5, and 2 MSa/s
+  2 MSa/s over native USB; Ethernet advertises 4.444, 4, 3.333, 2.5, and 2 MSa/s
 - Automatic or manual receive gain
 - Switchable automatic receive DC-offset tracking
 - Manual receive gain from 0 to 69 dB in 1 dB steps on the tested board
@@ -335,7 +339,7 @@ RX and TX handles may be created together, but simultaneous activation is
 rejected because the shared RF path is half-duplex.
 
 The `tx_wire_format` device setting makes the Ethernet precision/robustness
-tradeoff explicit. `auto` uses signed IQ8 at 4 and 10/3 MSa/s and packed IQ10
+tradeoff explicit. `auto` uses signed IQ8 at 40/9, 4, and 10/3 MSa/s and packed IQ10
 at 2.5 and 2 MSa/s. `iq8` and `iq10` force either negotiated codec at every
 Ethernet rate; non-auto values are rejected on native USB because USB always
 retains IQ10. The setting can also be supplied in the device arguments and
@@ -379,7 +383,7 @@ Bench measurements at 2.38 GHz provide useful scale for this contract:
   1.975 us late over USB. In the same runs, deadlines that expired during
   staging returned `TIME_ERROR`, left zero buffered samples, and emitted no
   late request.
-- Ethernet uses signed IQ8 transport at its 4 and 10/3 MSa/s high-rate modes;
+- Ethernet uses signed IQ8 transport at its 40/9, 4, and 10/3 MSa/s high-rate modes;
   firmware expands those samples to ordinary IQ10 modem words. At 4 MSa/s,
   the current selective-recovery uploader sent 100 batches (104,832,000
   samples, 26.208 s RF duration) with exact accounting and zero underflow,

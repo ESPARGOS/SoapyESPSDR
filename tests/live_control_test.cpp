@@ -96,6 +96,13 @@ int main(int argc, char **argv)
             }) != txRates.end();
         if (hasUsbCeiling != usbTransport)
             throw std::runtime_error("transport-specific TX ceiling mismatch");
+        const double ethernetCeiling = 40e6 / 9.0;
+        const bool hasEthernetCeiling = std::find_if(
+            txRates.begin(), txRates.end(), [ethernetCeiling](double rate) {
+                return std::abs(rate - ethernetCeiling) < 1.0;
+            }) != txRates.end();
+        if (!hasEthernetCeiling)
+            throw std::runtime_error("40/9 MSa/s TX rate is missing");
         for (const double rate : txRates) {
             device->setSampleRate(SOAPY_SDR_TX, 0, rate);
             if (std::abs(device->getSampleRate(SOAPY_SDR_TX, 0) - rate) > 1.0)
