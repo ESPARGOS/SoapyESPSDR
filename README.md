@@ -4,7 +4,7 @@
 
 Select the C5 explicitly with `driver=espsdr,serial=/dev/ttyACM0` on this PC.
 The port can change after a watchdog reset; match USB serial `3C:DC:75:88:C2:70`.
-It uses USB Serial/JTAG and protocol-4 firmware from the companion
+It uses USB Serial/JTAG and protocol-5 firmware from the companion
 `direct_iq_test` repository. RX rates are 4, 8, 10, 20, 40, and 80 MS/s;
 TX rates are 0.25, 0.5, 1, 2, 3, 4, 6, 40, and 80 MS/s. Both support CF32 and CS16.
 These are **finite, half-duplex bursts**, with at most 16,380 complex samples.
@@ -30,9 +30,16 @@ report with plots and the limits of the 100 MHz–6 GHz command sweep.
 
 Timed streams, continuous streaming, full duplex, adjustable gain, and hardware
 timestamps are unavailable. The LO is shared and tunes in 1 MHz steps from
-2402 to 2482 MHz; every 1 MHz step has been RF tested with the B210. Deactivate streams before
+2100–2700 MHz and 4800–6000 MHz. Every 1 MHz TX step in those ranges
+has been RF tested with the B210. These extended ranges are experimental on the
+tested dongle, not manufacturer-qualified operating bands; RX uses a coarser
+verification grid. See `direct_iq_test/doc/esp32c5-tuning.html` for the results. Deactivate streams before
 changing settings. A transport/CRC failure invalidates the device instance;
 close it, wait at least three seconds for the firmware upload timeout, and reopen.
+
+Known measured exception: **2560 MHz TX failed repeatedly**, although RX passed.
+The tuning command is accepted; usable TX at this frequency is not established.
+The experimental 2718 MHz edge was unstable and is outside the normal API.
 
 Build with the normal CMake instructions below. To test a local module while
 an older module is installed:

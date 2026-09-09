@@ -23,8 +23,8 @@ int main() {
         auto send=[&](const std::string &s){require(::write(master,s.data(),s.size())==ssize_t(s.size()),"emulator write");};
         require(line().empty(),"synchronization boundary");
         auto sync=line();require(sync.rfind("SYNC ",0)==0,"synchronization request");
-        send("old data\nC5SDR 4 burst 16380\n"+sync+"\n");
-        require(line()=="INFO","identity query");send("C5SDR 4 burst 16380\n");
+        send("old data\nC5SDR 5 burst 16380\n"+sync+"\n");
+        require(line()=="INFO","identity query");send("C5SDR 5 burst 16380\n");
         require(line()=="FREQ 2412","initial tune");send("OK\n");
         std::string wire(256*5/2,'\0');
         // I=-512, Q=-512 -> canonical RX (-1,+1). Includes binary newline.
@@ -37,6 +37,14 @@ int main() {
     });
     try {
         std::unique_ptr<SoapySDR::Device> d(makeC5({{"serial",path}}));
+        auto ranges=d->getFrequencyRange(SOAPY_SDR_RX,0);
+        require(ranges.size()==2 && ranges[0].minimum()==2100e6 && ranges[0].maximum()==2700e6 &&
+                ranges[1].minimum()==4800e6 && ranges[1].maximum()==6000e6,"dual band ranges");
+        for(double frequency : {2099e6,2701e6,4000e6,4799e6,6001e6}) {
+            bool rejected=false;
+            try {d->setFrequency(SOAPY_SDR_RX,0,frequency);}catch(const std::exception &){rejected=true;}
+            require(rejected,"unsupported/gap frequency accepted");
+        }
         auto s=d->setupStream(SOAPY_SDR_RX,SOAPY_SDR_CF32);
         require(d->activateStream(s,0,0,256)==0,"activation");
         std::complex<float> data[256];void *buffs[]={data};int flags=0;long long ns=0;

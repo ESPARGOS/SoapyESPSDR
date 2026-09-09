@@ -61,14 +61,14 @@ public:
         if(identity=="ERR command" || identity=="ERR command_length") {
             port.command("INFO",end);identity=port.line(end);
         }
-        if(identity!="C5SDR 4 burst 16380")throw std::runtime_error("C5: protocol-4 firmware required");
+        if(identity!="C5SDR 5 burst 16380")throw std::runtime_error("C5: protocol-5 firmware required");
         port.command("FREQ 2412",end);
         if(port.line(end)!="OK")throw std::runtime_error("C5: initial tune failed");
     }
     std::string getDriverKey() const override{return "espsdr";}
     std::string getHardwareKey() const override{return "ESP32-C5";}
     SoapySDR::Kwargs getHardwareInfo() const override {
-        return {{"transport","USB Serial/JTAG"},{"mode","finite burst, half duplex"},{"protocol","4"}};
+        return {{"transport","USB Serial/JTAG"},{"mode","finite burst, half duplex"},{"protocol","5"}};
     }
     SoapySDR::ArgInfoList getSettingInfo() const override {
         SoapySDR::ArgInfo a;a.key="TX_REPEATS";a.value="1";
@@ -98,11 +98,11 @@ public:
         if(name!="RF")throw std::runtime_error("C5: antenna must be RF");
     }
     std::vector<std::string> listFrequencies(int,size_t) const override{return {"RF"};}
-    SoapySDR::RangeList getFrequencyRange(int,size_t) const override{return {{2402e6,2482e6,1e6}};}
+    SoapySDR::RangeList getFrequencyRange(int,size_t) const override{return {{2100e6,2700e6,1e6},{4800e6,6000e6,1e6}};}
     SoapySDR::RangeList getFrequencyRange(int d,size_t c,const std::string &) const override{return getFrequencyRange(d,c);}
     void setFrequency(int d,size_t c,double hz,const SoapySDR::Kwargs &) override {
         channel(d,c);std::lock_guard<std::mutex> lock(mutex);idle();
-        if(!std::isfinite(hz)||hz<2402e6||hz>2482e6)throw std::runtime_error("C5: frequency outside 2402–2482 MHz");
+        if(!std::isfinite(hz)||!((hz>=2100e6&&hz<=2700e6)||(hz>=4800e6&&hz<=6000e6)))throw std::runtime_error("C5: frequency outside 2100–2700 / 4800–6000 MHz");
         auto mhz=std::lround(hz/1e6);auto end=deadline();port.command("FREQ "+std::to_string(mhz),end);
         if(port.line(end)!="OK")throw std::runtime_error("C5: tune failed");
         frequency=mhz*1e6;
