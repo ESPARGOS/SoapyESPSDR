@@ -25,3 +25,16 @@ inline std::vector<uint32_t> c5UnpackIQ(const std::vector<uint8_t> &bytes,size_t
     }
     return words;
 }
+
+// IQ8 retains the upper eight bits of each signed IQ10 field; no rounding.
+inline std::vector<uint8_t> c5PackIQ8(const std::vector<uint32_t> &words) {
+    std::vector<uint8_t> bytes(words.size()*2);
+    for(size_t j=0;j<words.size();j++){bytes[2*j]=(words[j]>>2)&255;bytes[2*j+1]=(words[j]>>12)&255;}
+    return bytes;
+}
+inline std::vector<uint32_t> c5UnpackIQ8(const std::vector<uint8_t> &bytes,size_t count) {
+    if(bytes.size()!=count*2)throw std::runtime_error("C5: incorrect IQ8 size");
+    std::vector<uint32_t> words(count);
+    for(size_t j=0;j<count;j++)words[j]=(uint32_t(bytes[2*j])<<2)|(uint32_t(bytes[2*j+1])<<12);
+    return words;
+}

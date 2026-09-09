@@ -28,6 +28,7 @@ class C5Device final : public SoapySDR::Device {
     double frequency=2412000000;
     bool failed=false;
     unsigned txRepeats=1;
+    unsigned wireBits=10;
     static void channel(int dir,size_t ch) {
         if((dir!=SOAPY_SDR_RX && dir!=SOAPY_SDR_TX)||ch)throw std::runtime_error("C5: invalid channel");
     }
@@ -61,23 +62,31 @@ public:
         if(identity=="ERR command" || identity=="ERR command_length") {
             port.command("INFO",end);identity=port.line(end);
         }
-        if(identity!="C5SDR 5 burst 16380")throw std::runtime_error("C5: protocol-5 firmware required");
+        if(identity!="C5SDR 6 burst 16380")throw std::runtime_error("C5: protocol-6 firmware required");
         port.command("FREQ 2412",end);
         if(port.line(end)!="OK")throw std::runtime_error("C5: initial tune failed");
     }
     std::string getDriverKey() const override{return "espsdr";}
     std::string getHardwareKey() const override{return "ESP32-C5";}
     SoapySDR::Kwargs getHardwareInfo() const override {
-        return {{"transport","USB Serial/JTAG"},{"mode","finite burst, half duplex"},{"protocol","5"}};
+        return {{"transport","USB Serial/JTAG"},{"mode","finite burst, half duplex"},{"protocol","6"}};
     }
     SoapySDR::ArgInfoList getSettingInfo() const override {
         SoapySDR::ArgInfo a;a.key="TX_REPEATS";a.value="1";
         a.name="TX buffer repetitions";a.type=SoapySDR::ArgInfo::INT;
         a.description="Repeat each uploaded TX buffer 1–255 times; total playback must be at most 100 ms.";
-        a.range=SoapySDR::Range(1,255,1);return {a};
+        a.range=SoapySDR::Range(1,255,1);
+        SoapySDR::ArgInfo w;w.key="WIRE_BITS";w.value="10";w.name="USB bits per I and Q";
+        w.type=SoapySDR::ArgInfo::INT;w.options={"10","8"};
+        w.description="10 is lossless; 8 discards two low bits per component. Applies to RX and TX while inactive.";
+        return {a,w};
     }
     void writeSetting(const std::string &key,const std::string &value) override {
         std::lock_guard<std::mutex> lock(mutex);idle();
+        if(key=="WIRE_BITS") {
+            if(value!="8" && value!="10")throw std::runtime_error("C5: WIRE_BITS must be 8 or 10");
+            wireBits=unsigned(std::stoul(value));return;
+        }
         if(key!="TX_REPEATS")throw std::runtime_error("C5: unknown setting");
         size_t used=0;unsigned long n=std::stoul(value,&used);
         if(used!=value.size()||n<1||n>255)throw std::runtime_error("C5: TX_REPEATS must be 1–255");
@@ -85,6 +94,7 @@ public:
     }
     std::string readSetting(const std::string &key) const override {
         std::lock_guard<std::mutex> lock(mutex);
+        if(key=="WIRE_BITS")return std::to_string(wireBits);
         if(key!="TX_REPEATS")throw std::runtime_error("C5: unknown setting");
         return std::to_string(txRepeats);
     }
@@ -158,12 +168,12 @@ public:
                 auto end=deadline(timeoutUs);unsigned div=0;
                 const double clocks[]={80000000,40000000,20000000,10000000,8000000,4000000};
                 while(clocks[div]!=rates[SOAPY_SDR_RX])++div;
-                port.command("CAP20 "+std::to_string(b.requested)+" "+std::to_string(div),end);
+                port.command(std::string(wireBits==8?"CAP16 ":"CAP20 ")+std::to_string(b.requested)+" "+std::to_string(div),end);
                 std::istringstream h(port.line(end));std::string tag;size_t count;uint32_t crc,us;
                 if(!(h>>tag>>count>>std::hex>>crc>>std::dec>>us)||tag!="DATA"||count!=b.requested)throw std::runtime_error("C5: invalid capture header");
-                std::vector<uint8_t> wire((count*20+7)/8);port.read(wire.data(),wire.size(),end);
+                std::vector<uint8_t> wire(wireBits==8?count*2:(count*20+7)/8);port.read(wire.data(),wire.size(),end);
                 if(crc32(0,wire.data(),wire.size())!=crc)throw std::runtime_error("C5: capture CRC mismatch");
-                b.words=c5UnpackIQ(wire,count);
+                b.words=wireBits==8?c5UnpackIQ8(wire,count):c5UnpackIQ(wire,count);
             }
             n=std::min(n,b.words.size()-b.offset);
             for(size_t j=0;j<n;j++) {
@@ -192,10 +202,10 @@ public:
             uint32_t w=(uint32_t(int(std::round(std::clamp(i,-512.0f,511.0f))))&1023)|((uint32_t(int(std::round(std::clamp(q,-512.0f,511.0f))))&1023)<<10);
             words[j]=w;
         }
-        auto wire=c5PackIQ(words);
+        auto wire=wireBits==8?c5PackIQ8(words):c5PackIQ(words);
         try {
             auto end=deadline(timeoutUs);std::ostringstream cmd;
-            cmd<<(txRepeats==1?"TX20 ":"LOOP20 ")<<n<<" "<<unsigned(rates[SOAPY_SDR_TX])<<" ";
+            cmd<<(txRepeats==1?(wireBits==8?"TX16 ":"TX20 "):(wireBits==8?"LOOP16 ":"LOOP20 "))<<n<<" "<<unsigned(rates[SOAPY_SDR_TX])<<" ";
             if(txRepeats!=1)cmd<<txRepeats<<" ";
             cmd<<std::hex<<crc32(0,wire.data(),wire.size());
             port.command(cmd.str(),end);

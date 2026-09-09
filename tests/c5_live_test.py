@@ -6,11 +6,18 @@ import SoapySDR as S
 
 p=argparse.ArgumentParser(description=__doc__)
 p.add_argument('--port',default='/dev/ttyACM0')
+p.add_argument('--wire-bits',type=int,choices=[8,10],default=10)
 p.add_argument('--tx',action='store_true')
 a=p.parse_args()
 S.loadModules()
 d=S.Device('driver=espsdr,serial='+a.port)
 assert d.getHardwareKey()=='ESP32-C5'
+d.writeSetting('WIRE_BITS',str(a.wire_bits))
+assert d.readSetting('WIRE_BITS')==str(a.wire_bits)
+for value in ['0','9','16','8x']:
+ try:d.writeSetting('WIRE_BITS',value)
+ except RuntimeError:pass
+ else:raise AssertionError('invalid WIRE_BITS accepted')
 assert not d.getFullDuplex(S.SOAPY_SDR_RX,0)
 report=[]
 for fmt,dtype in ((S.SOAPY_SDR_CF32,np.complex64),(S.SOAPY_SDR_CS16,np.int16)):
@@ -25,6 +32,11 @@ for fmt,dtype in ((S.SOAPY_SDR_CF32,np.complex64),(S.SOAPY_SDR_CS16,np.int16)):
     b=np.empty(1000 if dtype==np.complex64 else 2000,dtype)
     r=d.readStream(rx,[b],1000,timeoutUs=1000000)
     assert r.ret>0,r
+    if a.wire_bits==8:
+     if dtype==np.complex64:
+      assert np.all(b[:r.ret].real*128==np.rint(b[:r.ret].real*128))
+      assert np.all(b[:r.ret].imag*128==np.rint(b[:r.ret].imag*128))
+     else:assert np.all((b[:r.ret*2]%256==0)|(b[:r.ret*2]==32767))
     count+=r.ret
     assert bool(r.flags&S.SOAPY_SDR_END_BURST)==(count==16380)
    assert d.readStream(rx,[b],1000,timeoutUs=1000).ret==S.SOAPY_SDR_TIMEOUT

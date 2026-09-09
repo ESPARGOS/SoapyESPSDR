@@ -1,10 +1,19 @@
 # SoapyESPSDR
 
+Optional **8-bit I + 8-bit Q USB transport** is now available with
+`writeSetting("WIRE_BITS", "8")` while inactive; restore the lossless default
+with `"10"`. CF32 and CS16 application formats remain supported. IQ8 discards
+the two low bits per component and uses 32,760 bytes per full buffer. The
+hardware still holds 16,380 complex samples. See the companion
+`direct_iq_test/doc/esp32c5-iq8.html` for measured USB throughput and RF checks.
+Sustained framed USB transfers have gaps between RF captures/playbacks;
+gap-free continuous streaming is not implemented.
+
 ## ESP32-C5 on this branch
 
 Select the C5 explicitly with `driver=espsdr,serial=/dev/ttyACM0` on this PC.
 The port can change after a watchdog reset; match USB serial `3C:DC:75:88:C2:70`.
-It uses USB Serial/JTAG and protocol-5 firmware from the companion
+It uses USB Serial/JTAG and protocol-6 firmware from the companion
 `direct_iq_test` repository. RX rates are 4, 8, 10, 20, 40, and 80 MS/s;
 TX rates are 0.25, 0.5, 1, 2, 3, 4, 6, 40, and 80 MS/s. Both support CF32 and CS16.
 These are **finite, half-duplex bursts**, with at most 16,380 complex samples.
