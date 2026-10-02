@@ -9,8 +9,9 @@ SoapyESPSDR is a [SoapySDR](https://github.com/pothosware/SoapySDR) plugin that 
 you use an ESP32-S31 as a radio receiver in Gqrx, GNU Radio, and other
 SoapySDR-compatible applications.
 
-[ESP-WebSDR](https://espargos.net/espsdr/app/) lets you explore signals in your
-browser. SoapyESPSDR adds continuous I/Q streaming to desktop applications:
+SoapyESPSDR is different from [ESP-WebSDR](https://espargos.net/espsdr/app/),
+which lets you explore signals in your browser, but with a limited capture duty cycle.
+SoapyESPSDR adds **continuous** I/Q streaming to desktop applications:
 listen to signals in Gqrx, record samples, or build your own demodulator in
 GNU Radio. Transmission is not supported.
 
@@ -20,8 +21,8 @@ Signal quality, including the remaining DC peak, still needs improvement.
 ## What you need
 
 - Linux and an **ESP32-S31 Function-CoreBoard** running ESP-SDR's
-  **`esp32s31-stream`** firmware. The ordinary `esp32s31` browser-viewer firmware
-  uses a different protocol. See the [firmware setup guide](https://github.com/ESPARGOS/esp-sdr/blob/main/docs/s31-streaming.md).
+  **ESP32-S31 Function-CoreBoard · Ethernet / USB for SoapyESPSDR** firmware. This is different from the ordinary ESP32-S31 firmware for use with [ESP-WebSDR](https://espargos.net/espsdr/app/), which uses a different (much slower) protocol.
+  Just flash the firmware [from your browser](https://espargos.net/espsdr/app/flash.html).
 - The board's native **high-speed USB** connector or **Gigabit Ethernet**.
   The UART and USB Serial/JTAG connectors are for flashing/debugging.
   Ethernet must be gigabit along the entire path; shared USB bandwidth can
