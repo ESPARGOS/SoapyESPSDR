@@ -1,0 +1,13 @@
+name: Build and test
+on: [push, pull_request, workflow_dispatch]
+permissions:
+  contents: read
+jobs:
+  linux:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y cmake g++ libsoapysdr-dev libcurl4-openssl-dev libjsoncpp-dev libusb-1.0-0-dev python3-soapysdr python3-numpy
+      - run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build -j2
+      - run: ctest --test-dir build --output-on-failure
+      - run: SOAPY_SDR_ROOT="$PWD/build" SOAPY_SDR_PLUGIN_PATH="$PWD/build" python3 tests/loopback_test.py
