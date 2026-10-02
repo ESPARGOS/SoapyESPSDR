@@ -59,7 +59,7 @@ SUBSYSTEM=="usb", ATTRS{idVendor}=="303a", ATTRS{idProduct}=="4531", MODE="0660"
 ## Connect
 
 For Ethernet, find the board's DHCP address in your router or UART boot log.
-Replace `192.168.1.100` below with that address. Open it in a browser for the
+**Replace `192.168.1.100` below with that address**. Open it in a browser for the
 board's control/status page.
 
 | Connection | Gqrx device string (choose **Other**) |
