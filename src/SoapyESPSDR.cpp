@@ -240,7 +240,7 @@ class Device final : public SoapySDR::Device {
     }
     SoapySDR::RangeList getFrequencyRange(int dir, size_t ch) const override {
         channel(dir, ch);
-        return {{2300e6, 2800e6, 1e6}};
+        return {{2150e6, 2800e6, 1e6}};
     }
     SoapySDR::RangeList getFrequencyRange(int dir, size_t ch,
                                           const std::string &name) const override {

@@ -216,7 +216,9 @@ class Streaming(unittest.TestCase):
         self.assertEqual(self.device.readSensor("rx_missing_samples"), "672")
 
         old_epoch = self.receiver.state["epoch"]
-        self.device.setFrequency(soapy.SOAPY_SDR_RX, 0, 2450000000)
+        ranges = self.device.getFrequencyRange(soapy.SOAPY_SDR_RX, 0)
+        self.assertTrue(any(r.minimum() <= 2150000000 <= r.maximum() for r in ranges))
+        self.device.setFrequency(soapy.SOAPY_SDR_RX, 0, 2150000000)
         self.receiver.emit(2016, epoch=old_epoch)  # In-flight old session.
         self.receiver.emit()
         self.assertEqual(self.read(np.int8)[0].ret, 672)

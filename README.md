@@ -85,7 +85,7 @@ is unauthenticated; use a trusted local network.
 
 ## Capabilities and limitations
 
-- **Tuning:** 2300–2800 MHz in 1 MHz steps; manual gain is a PHY table index,
+- **Tuning:** 2150–2800 MHz in 1 MHz steps (chip-dependent); manual gain is a PHY table index,
   not calibrated dB.
 - **Sample rates:** 4, 8, 16, 20 MSa/s; Ethernet also supports 40 MSa/s.
 - **Samples:** native signed 8-bit I and 8-bit Q. `CS8`, `CS16`, and `CF32`
