@@ -27,6 +27,7 @@ class Server(http.server.ThreadingHTTPServer):
             frequency=2412000000,
             rate=4000000,
             gain=40,
+            agc=0,
             gain_max=69,
             bandwidth=0,
             dc_correction=1,
@@ -56,11 +57,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
     def do_POST(self):
         request = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+        if request["op"] == "legacy":
+            self.server.state.pop("agc", None)
         if request["op"] == "bad_reply":
             self.server.bad_reply = request["operation"]
         if request["op"] in ("start", "configure", "stop"):
             self.server.state["epoch"] += 1
-            for key in ("frequency", "rate", "gain", "bandwidth", "dc_correction"):
+            for key in ("frequency", "rate", "gain", "bandwidth", "dc_correction", "agc"):
                 if key in request:
                     self.server.state[key] = request[key]
         if request["op"] == "stop":
@@ -179,6 +182,35 @@ class Streaming(unittest.TestCase):
             self.device.deactivateStream(self.stream)
             self.device.closeStream(self.stream)
             self.stream = None
+
+    def test_old_firmware_does_not_advertise_hardware_agc(self):
+        self.receiver.request(dict(op="legacy"))
+        self.device = None
+        self.device = soapy.Device(
+            f"driver=espsdr,host=127.0.0.1,http_port={self.receiver.server_port}"
+        )
+        self.assertFalse(self.device.hasGainMode(soapy.SOAPY_SDR_RX, 0))
+        epoch = self.receiver.state["epoch"]
+        self.device.setGainMode(soapy.SOAPY_SDR_RX, 0, False)
+        self.assertEqual(self.receiver.state["epoch"], epoch)
+        with self.assertRaises(RuntimeError):
+            self.device.setGainMode(soapy.SOAPY_SDR_RX, 0, True)
+
+    def test_hardware_agc_switch_while_streaming(self):
+        self.assertTrue(self.device.hasGainMode(soapy.SOAPY_SDR_RX, 0))
+        self.assertFalse(self.device.getGainMode(soapy.SOAPY_SDR_RX, 0))
+        self.device.setGain(soapy.SOAPY_SDR_RX, 0, 32)
+        self.open("CS8")
+        for automatic in (True, False, True):
+            old_epoch = self.receiver.state["epoch"]
+            self.device.setGainMode(soapy.SOAPY_SDR_RX, 0, automatic)
+            self.assertEqual(self.device.getGainMode(soapy.SOAPY_SDR_RX, 0), automatic)
+            self.assertEqual(self.receiver.state["agc"], int(automatic))
+            self.assertEqual(self.receiver.state["gain"], 32)
+            self.assertGreater(self.receiver.state["epoch"], old_epoch)
+            self.receiver.emit(epoch=old_epoch)
+            self.receiver.emit()
+            self.assertEqual(self.read(np.int8)[0].ret, 672)
 
     def test_dc_removal_and_bypass(self):
         self.assertTrue(self.device.hasDCOffsetMode(soapy.SOAPY_SDR_RX, 0))

@@ -87,6 +87,10 @@ is unauthenticated; use a trusted local network.
 
 - **Tuning:** 2150–2800 MHz in 1 MHz steps (chip-dependent); manual gain is a PHY table index,
   not calibrated dB.
+- **Gain mode:** Gqrx's hardware AGC checkbox selects automatic receiver gain.
+  Update the S31 streaming firmware as well as this driver; older firmware
+  does not expose AGC. With AGC enabled, the manual gain index is retained
+  for use when AGC is disabled.
 - **Sample rates:** 4, 8, 16, 20 MSa/s; Ethernet also supports 40 MSa/s.
 - **Samples:** native signed 8-bit I and 8-bit Q. `CS8`, `CS16`, and `CF32`
   are supported; wider formats do not add ADC precision.

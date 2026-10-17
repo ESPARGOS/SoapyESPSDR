@@ -184,6 +184,24 @@ class Device final : public SoapySDR::Device {
         channel(dir, ch);
         return automaticDc;
     }
+    bool hasGainMode(int dir, size_t ch) const override {
+        channel(dir, ch);
+        std::lock_guard<std::mutex> lock(controlMutex);
+        return config["agc"].isUInt();
+    }
+    void setGainMode(int dir, size_t ch, bool automatic) override {
+        channel(dir, ch);
+        if (!hasGainMode(dir, ch)) {
+            if (automatic)
+                throw std::runtime_error("Update ESP-SDR streaming firmware for hardware AGC");
+            return;
+        }
+        setting("agc", automatic ? 1 : 0);
+    }
+    bool getGainMode(int dir, size_t ch) const override {
+        channel(dir, ch);
+        return configNumber("agc") != 0;
+    }
     std::vector<std::string> listGains(int dir, size_t ch) const override {
         channel(dir, ch);
         return {"RF"};

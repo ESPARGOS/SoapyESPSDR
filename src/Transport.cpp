@@ -27,6 +27,8 @@ static Json::Value parse(const std::string &text) {
         throw std::runtime_error("Install the ESP32-S31 streaming firmware (RX protocol v2)");
     if (!r["dc_correction"].isUInt() || r["dc_correction"].asUInt() > 1)
         throw std::runtime_error("Invalid ESP-SDR DC correction setting");
+    if (r.isMember("agc") && (!r["agc"].isUInt() || r["agc"].asUInt() > 1))
+        throw std::runtime_error("Invalid ESP-SDR hardware AGC setting");
     return r;
 }
 static std::string encode(const Json::Value &v) {
